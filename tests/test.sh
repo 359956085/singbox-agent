@@ -148,6 +148,12 @@ PY
         done
         printf 'PNG\n' >"$output"
     }
+    original_app_dir="$APP_DIR"
+    original_web_dir="$WEB_DIR"
+    original_uri_file="$URI_FILE"
+    original_qr_file="$QR_FILE"
+    original_clash_subscription="$WEB_CLASH_SUBSCRIPTION"
+    original_vless_subscription="$WEB_VLESS_SUBSCRIPTION"
     APP_DIR="${temp_dir}/app"
     WEB_DIR="${temp_dir}/www"
     URI_FILE="${APP_DIR}/vless-uri.txt"
@@ -158,6 +164,12 @@ PY
     decoded_uri="$(base64 -d "$WEB_VLESS_SUBSCRIPTION")"
     assert_equal "Base64 解码严格等于 VLESS URI" "$(build_vless_uri)" "$decoded_uri"
     assert_true "客户端二维码已生成" test -s "$QR_FILE"
+    APP_DIR="$original_app_dir"
+    WEB_DIR="$original_web_dir"
+    URI_FILE="$original_uri_file"
+    QR_FILE="$original_qr_file"
+    WEB_CLASH_SUBSCRIPTION="$original_clash_subscription"
+    WEB_VLESS_SUBSCRIPTION="$original_vless_subscription"
 
     PUBLIC_IP="203.0.113.10"
     render_nginx_config "${temp_dir}/nginx-ipv4.conf"
