@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly STATE_VERSION="1"
 readonly OFFICIAL_KEY_URL="https://sing-box.app/gpg.key"
 readonly OFFICIAL_REPO_URL="https://deb.sagernet.org/"
@@ -20,7 +20,9 @@ QR_FILE="${APP_DIR}/vless.png"
 SINGBOX_DIR="${ROOT_PREFIX}/etc/sing-box"
 SINGBOX_CONFIG="${SINGBOX_DIR}/config.json"
 WEB_DIR="${ROOT_PREFIX}/var/lib/singbox-agent/www"
-WEB_SUBSCRIPTION="${WEB_DIR}/subscription.txt"
+WEB_CLASH_SUBSCRIPTION="${WEB_DIR}/clash.yaml"
+WEB_VLESS_SUBSCRIPTION="${WEB_DIR}/vless.txt"
+LEGACY_WEB_SUBSCRIPTION="${WEB_DIR}/subscription.txt"
 NGINX_SITE_AVAILABLE="${ROOT_PREFIX}/etc/nginx/sites-available/singbox-agent-subscription"
 NGINX_SITE_ENABLED="${ROOT_PREFIX}/etc/nginx/sites-enabled/singbox-agent-subscription"
 MANAGER_DIR="${ROOT_PREFIX}/usr/local/lib/singbox-agent"
@@ -93,7 +95,9 @@ rollback_transaction() {
     restore_path "$SINGBOX_CONFIG" "singbox-config"
     restore_path "$NGINX_SITE_AVAILABLE" "nginx-site"
     restore_path "$NGINX_SITE_ENABLED" "nginx-link"
-    restore_path "$WEB_SUBSCRIPTION" "web-subscription"
+    restore_path "$WEB_CLASH_SUBSCRIPTION" "clash-subscription"
+    restore_path "$WEB_VLESS_SUBSCRIPTION" "vless-subscription"
+    restore_path "$LEGACY_WEB_SUBSCRIPTION" "legacy-subscription"
     restore_path "$URI_FILE" "uri"
     restore_path "$QR_FILE" "qr"
     restore_path "$STATE_FILE" "state"
@@ -278,8 +282,12 @@ build_vless_uri() {
         "$UUID" "$address" "$REALITY_PORT" "$REALITY_HOST" "$PUBLIC_KEY" "$SHORT_ID" "$node_encoded"
 }
 
-build_subscription_url() {
+build_clash_subscription_url() {
     printf 'http://%s:%s/sub/%s' "$(format_url_host "$PUBLIC_IP")" "$SUBSCRIPTION_PORT" "$SUBSCRIPTION_TOKEN"
+}
+
+build_vless_subscription_url() {
+    printf 'http://%s:%s/sub/%s/vless' "$(format_url_host "$PUBLIC_IP")" "$SUBSCRIPTION_PORT" "$SUBSCRIPTION_TOKEN"
 }
 
 detect_public_ip() {
@@ -656,7 +664,14 @@ server {
 
     location = /sub/${SUBSCRIPTION_TOKEN} {
         limit_except GET { deny all; }
-        alias ${WEB_SUBSCRIPTION};
+        alias ${WEB_CLASH_SUBSCRIPTION};
+        default_type application/yaml;
+        add_header Cache-Control "no-store" always;
+    }
+
+    location = /sub/${SUBSCRIPTION_TOKEN}/vless {
+        limit_except GET { deny all; }
+        alias ${WEB_VLESS_SUBSCRIPTION};
         default_type text/plain;
         add_header Cache-Control "no-store" always;
     }
@@ -668,8 +683,53 @@ server {
 EOF
 }
 
+yaml_quote() {
+    jq -Rn --arg value "$1" '$value'
+}
+
+render_mihomo_subscription() {
+    local output="$1"
+    local clash_node_name node_quoted server_quoted uuid_quoted sni_quoted public_key_quoted short_id_quoted
+    clash_node_name="${NODE_NAME}-Reality"
+    node_quoted="$(yaml_quote "$clash_node_name")"
+    server_quoted="$(yaml_quote "$PUBLIC_IP")"
+    uuid_quoted="$(yaml_quote "$UUID")"
+    sni_quoted="$(yaml_quote "$REALITY_HOST")"
+    public_key_quoted="$(yaml_quote "$PUBLIC_KEY")"
+    short_id_quoted="$(yaml_quote "$SHORT_ID")"
+    cat >"$output" <<EOF
+proxies:
+  - name: ${node_quoted}
+    type: vless
+    server: ${server_quoted}
+    port: ${REALITY_PORT}
+    uuid: ${uuid_quoted}
+    network: tcp
+    udp: true
+    tls: true
+    servername: ${sni_quoted}
+    flow: xtls-rprx-vision
+    packet-encoding: xudp
+    client-fingerprint: chrome
+    encryption: ""
+    reality-opts:
+      public-key: ${public_key_quoted}
+      short-id: ${short_id_quoted}
+
+proxy-groups:
+  - name: "节点选择"
+    type: select
+    proxies:
+      - ${node_quoted}
+      - DIRECT
+
+rules:
+  - "MATCH,节点选择"
+EOF
+}
+
 write_client_artifacts() {
-    local uri web_temp uri_temp qr_temp
+    local uri clash_temp vless_temp uri_temp qr_temp
     uri="$(build_vless_uri)"
     mkdir -p -- "$APP_DIR" "$WEB_DIR"
     chmod 700 "$APP_DIR"
@@ -682,11 +742,15 @@ write_client_artifacts() {
     qrencode -o "$qr_temp" -s 8 -m 2 "$uri"
     chmod 600 "$qr_temp"
     mv -f -- "$qr_temp" "$QR_FILE"
-    web_temp="$(mktemp "${WEB_DIR}/.subscription.XXXXXX")"
-    printf '%s\n' "$uri" | base64 -w 0 >"$web_temp"
-    printf '\n' >>"$web_temp"
-    chmod 644 "$web_temp"
-    mv -f -- "$web_temp" "$WEB_SUBSCRIPTION"
+    clash_temp="$(mktemp "${WEB_DIR}/.clash.XXXXXX")"
+    render_mihomo_subscription "$clash_temp"
+    chmod 644 "$clash_temp"
+    mv -f -- "$clash_temp" "$WEB_CLASH_SUBSCRIPTION"
+    vless_temp="$(mktemp "${WEB_DIR}/.vless.XXXXXX")"
+    printf '%s\n' "$uri" | base64 -w 0 >"$vless_temp"
+    printf '\n' >>"$vless_temp"
+    chmod 644 "$vless_temp"
+    mv -f -- "$vless_temp" "$WEB_VLESS_SUBSCRIPTION"
 }
 
 install_nginx_config() {
@@ -700,6 +764,7 @@ install_nginx_config() {
     nginx -t
     nginx_dump="$(nginx -T 2>&1)"
     grep -Fq "location = /sub/${SUBSCRIPTION_TOKEN}" <<<"$nginx_dump" || fatal "nginx 未加载 sites-enabled 配置。"
+    grep -Fq "location = /sub/${SUBSCRIPTION_TOKEN}/vless" <<<"$nginx_dump" || fatal "nginx 未加载 Base64 VLESS 订阅配置。"
 }
 
 ufw_is_active() {
@@ -764,7 +829,9 @@ begin_transaction() {
     backup_path "$SINGBOX_CONFIG" "singbox-config"
     backup_path "$NGINX_SITE_AVAILABLE" "nginx-site"
     backup_path "$NGINX_SITE_ENABLED" "nginx-link"
-    backup_path "$WEB_SUBSCRIPTION" "web-subscription"
+    backup_path "$WEB_CLASH_SUBSCRIPTION" "clash-subscription"
+    backup_path "$WEB_VLESS_SUBSCRIPTION" "vless-subscription"
+    backup_path "$LEGACY_WEB_SUBSCRIPTION" "legacy-subscription"
     backup_path "$URI_FILE" "uri"
     backup_path "$QR_FILE" "qr"
     backup_path "$STATE_FILE" "state"
@@ -830,6 +897,7 @@ configure_installation() {
     write_client_artifacts
     install_nginx_config
     start_services
+    rm -f -- "$LEGACY_WEB_SUBSCRIPTION"
 
     UFW_REALITY_RULE_CREATED=0
     UFW_SUBSCRIPTION_RULE_CREATED=0
@@ -879,10 +947,11 @@ install_command() {
 }
 
 show_configuration() {
-    local uri subscription_url singbox_status nginx_status version
+    local uri clash_subscription_url vless_subscription_url singbox_status nginx_status version
     load_state
     uri="$(build_vless_uri)"
-    subscription_url="$(build_subscription_url)"
+    clash_subscription_url="$(build_clash_subscription_url)"
+    vless_subscription_url="$(build_vless_subscription_url)"
     singbox_status="$(systemctl is-active sing-box.service 2>/dev/null || true)"
     nginx_status="$(systemctl is-active nginx.service 2>/dev/null || true)"
     version="$(sing-box version 2>/dev/null | awk '/sing-box version/ {print $3; exit}')"
@@ -895,7 +964,8 @@ show_configuration() {
     printf '公钥：%s\n' "$PUBLIC_KEY"
     printf 'short ID：%s\n' "$SHORT_ID"
     printf '\nVLESS：\n%s\n' "$uri"
-    printf '\n在线订阅：\n%s\n' "$subscription_url"
+    printf '\nClash/Mihomo 在线订阅：\n%s\n' "$clash_subscription_url"
+    printf '\nBase64 VLESS 在线订阅：\n%s\n' "$vless_subscription_url"
     printf '\n二维码文件：%s\n\n' "$QR_FILE"
     if command_exists qrencode; then
         qrencode -t ANSIUTF8 "$uri" || warn "终端二维码生成失败。"
@@ -1005,7 +1075,8 @@ uninstall_command() {
     fi
     [[ "$APT_SOURCE_CREATED" == "1" ]] && rm -f -- "$APT_SOURCE_FILE"
     [[ "$APT_KEY_CREATED" == "1" ]] && rm -f -- "$APT_KEY_FILE"
-    rm -f -- "$SINGBOX_CONFIG" "$URI_FILE" "$QR_FILE" "$STATE_FILE" "$COMMAND_LINK" "$MANAGER_FILE" "$WEB_SUBSCRIPTION"
+    rm -f -- "$SINGBOX_CONFIG" "$URI_FILE" "$QR_FILE" "$STATE_FILE" "$COMMAND_LINK" "$MANAGER_FILE" \
+        "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION" "$LEGACY_WEB_SUBSCRIPTION"
     rmdir "$WEB_DIR" "$(dirname "$WEB_DIR")" "$APP_DIR" "$MANAGER_DIR" 2>/dev/null || true
     rm -rf -- "$CACHE_DIR"
     success "singbox-agent 已卸载。"

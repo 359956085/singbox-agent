@@ -72,7 +72,7 @@ assert_false "拒绝终端转义字符" validate_node_name $'node\033[31m'
 assert_equal "IPv6 URL 方括号" "[2001:db8::1]" "$(format_url_host '2001:db8::1')"
 
 if command -v jq >/dev/null 2>&1; then
-    NODE_NAME="测试 节点"
+    NODE_NAME='测试: "节点" #1'
     PUBLIC_IP="2001:db8::1"
     REALITY_PORT="23456"
     REALITY_HOST="addons.mozilla.org"
@@ -81,7 +81,7 @@ if command -v jq >/dev/null 2>&1; then
     UUID="11111111-2222-3333-4444-555555555555"
     uri="$(build_vless_uri)"
     assert_true "URI 使用 IPv6 方括号" grep -Fq '@[2001:db8::1]:23456' <<<"$uri"
-    assert_true "节点名已编码" grep -Fq '#%E6%B5%8B%E8%AF%95%20%E8%8A%82%E7%82%B9' <<<"$uri"
+    assert_true "节点名已编码" grep -Fq '#%E6%B5%8B%E8%AF%95%3A%20%22%E8%8A%82%E7%82%B9%22%20%231' <<<"$uri"
 
     temp_dir="${TEST_SANDBOX}/render"
     mkdir -p "$temp_dir"
@@ -96,10 +96,69 @@ if command -v jq >/dev/null 2>&1; then
     SUBSCRIPTION_PORT="45678"
     SUBSCRIPTION_TOKEN="$(printf 'ab%.0s' {1..32})"
     render_nginx_config "${temp_dir}/nginx.conf"
-    assert_true "nginx 使用精确订阅路径" grep -Fq "location = /sub/${SUBSCRIPTION_TOKEN}" "${temp_dir}/nginx.conf"
+    assert_true "nginx 使用精确 Clash 订阅路径" grep -Fq "location = /sub/${SUBSCRIPTION_TOKEN} {" "${temp_dir}/nginx.conf"
+    assert_true "nginx 使用精确 VLESS 订阅路径" grep -Fq "location = /sub/${SUBSCRIPTION_TOKEN}/vless {" "${temp_dir}/nginx.conf"
+    assert_true "Clash 订阅使用 YAML 类型" grep -Fq 'default_type application/yaml;' "${temp_dir}/nginx.conf"
+    assert_true "VLESS 订阅使用文本类型" grep -Fq 'default_type text/plain;' "${temp_dir}/nginx.conf"
+    assert_equal "nginx 两个订阅仅允许 GET 和 HEAD" "2" "$(grep -Fc 'limit_except GET { deny all; }' "${temp_dir}/nginx.conf")"
     assert_true "nginx 关闭访问日志" grep -Fq 'access_log off;' "${temp_dir}/nginx.conf"
     assert_true "nginx 默认返回 404" grep -Fq 'return 404;' "${temp_dir}/nginx.conf"
     assert_true "IPv6 订阅仅监听 IPv6" grep -Fq 'listen [::]:45678 ipv6only=on default_server;' "${temp_dir}/nginx.conf"
+
+    render_mihomo_subscription "${temp_dir}/clash.yaml"
+    assert_true "Mihomo 包含 VLESS Reality" grep -Fq 'type: vless' "${temp_dir}/clash.yaml"
+    assert_true "Mihomo 包含 Vision" grep -Fq 'flow: xtls-rprx-vision' "${temp_dir}/clash.yaml"
+    assert_true "Mihomo 包含 XUDP" grep -Fq 'packet-encoding: xudp' "${temp_dir}/clash.yaml"
+    assert_true "Mihomo 包含 Reality 公钥" grep -Fq 'public-key:' "${temp_dir}/clash.yaml"
+    assert_true "Mihomo 包含代理组" grep -Fq 'proxy-groups:' "${temp_dir}/clash.yaml"
+    assert_true "Mihomo 包含兜底规则" grep -Fq 'MATCH,节点选择' "${temp_dir}/clash.yaml"
+
+    yaml_python=""
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+        yaml_python="python3"
+    elif command -v python >/dev/null 2>&1 && python -c 'import yaml' >/dev/null 2>&1; then
+        yaml_python="python"
+    fi
+    if [[ -n "$yaml_python" ]]; then
+        assert_true "Mihomo YAML 是有效顶层映射" "$yaml_python" - "${temp_dir}/clash.yaml" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = yaml.safe_load(stream)
+assert isinstance(data, dict)
+assert data["proxies"][0]["type"] == "vless"
+assert data["proxies"][0]["reality-opts"]["short-id"] == "0123456789abcdef"
+assert data["proxy-groups"][0]["name"] == "节点选择"
+assert data["rules"] == ["MATCH,节点选择"]
+PY
+    else
+        printf '跳过：未安装 PyYAML，无法解析 Mihomo YAML。\n'
+    fi
+
+    qrencode() {
+        local output=""
+        while (($#)); do
+            if [[ "$1" == "-o" ]]; then
+                output="$2"
+                shift 2
+            else
+                shift
+            fi
+        done
+        printf 'PNG\n' >"$output"
+    }
+    APP_DIR="${temp_dir}/app"
+    WEB_DIR="${temp_dir}/www"
+    URI_FILE="${APP_DIR}/vless-uri.txt"
+    QR_FILE="${APP_DIR}/vless.png"
+    WEB_CLASH_SUBSCRIPTION="${WEB_DIR}/clash.yaml"
+    WEB_VLESS_SUBSCRIPTION="${WEB_DIR}/vless.txt"
+    write_client_artifacts
+    decoded_uri="$(base64 -d "$WEB_VLESS_SUBSCRIPTION")"
+    assert_equal "Base64 解码严格等于 VLESS URI" "$(build_vless_uri)" "$decoded_uri"
+    assert_true "客户端二维码已生成" test -s "$QR_FILE"
+
     PUBLIC_IP="203.0.113.10"
     render_nginx_config "${temp_dir}/nginx-ipv4.conf"
     assert_false "IPv4 订阅不强制监听 IPv6" grep -Fq 'listen [::]' "${temp_dir}/nginx-ipv4.conf"
@@ -132,12 +191,16 @@ UFW_SUBSCRIPTION_RULE_CREATED=0
 INSTALLED_VERSION="1.0.0"
 write_state
 mkdir -p "$SINGBOX_DIR" "$(dirname "$NGINX_SITE_AVAILABLE")" "$(dirname "$NGINX_SITE_ENABLED")" "$WEB_DIR" "$MANAGER_DIR" "$(dirname "$COMMAND_LINK")"
-touch "$SINGBOX_CONFIG" "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED" "$WEB_SUBSCRIPTION" "$URI_FILE" "$QR_FILE" "$MANAGER_FILE" "$COMMAND_LINK"
+touch "$SINGBOX_CONFIG" "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED" "$WEB_CLASH_SUBSCRIPTION" \
+    "$WEB_VLESS_SUBSCRIPTION" "$LEGACY_WEB_SUBSCRIPTION" "$URI_FILE" "$QR_FILE" "$MANAGER_FILE" "$COMMAND_LINK"
 user_nginx_file="$(dirname "$NGINX_SITE_AVAILABLE")/user-site"
 printf '用户配置\n' >"$user_nginx_file"
 uninstall_command <<<'y'
 assert_false "卸载删除项目配置" test -e "$SINGBOX_CONFIG"
 assert_false "卸载删除项目 nginx 配置" test -e "$NGINX_SITE_AVAILABLE"
+assert_false "卸载删除 Clash 订阅" test -e "$WEB_CLASH_SUBSCRIPTION"
+assert_false "卸载删除 VLESS 订阅" test -e "$WEB_VLESS_SUBSCRIPTION"
+assert_false "卸载删除旧订阅文件" test -e "$LEGACY_WEB_SUBSCRIPTION"
 assert_false "卸载删除状态目录" test -e "$APP_DIR"
 assert_true "卸载保留用户 nginx 配置" test -e "$user_nginx_file"
 

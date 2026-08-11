@@ -5,18 +5,14 @@
 - 协议：VLESS + TCP + Reality + Vision
 - 系统：Debian / Ubuntu，systemd
 - 架构：amd64 / arm64
-- 产物：VLESS 链接、本地二维码、PNG、Base64 在线订阅
+- 产物：VLESS 链接、本地二维码、PNG、Clash/Mihomo YAML 与 Base64 VLESS 在线订阅
 
 ## 一键安装
 
 使用 root 用户执行：
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/359956085/singbox-agent/main/install.sh \
-  -o /tmp/singbox-agent.sh \
-  && chmod 700 /tmp/singbox-agent.sh \
-  && sudo /tmp/singbox-agent.sh install
+apt-get update && apt-get install -y wget ca-certificates && wget -O /tmp/singbox-agent.sh https://raw.githubusercontent.com/359956085/singbox-agent/main/install.sh && chmod 700 /tmp/singbox-agent.sh && /tmp/singbox-agent.sh install
 ```
 
 安装过程会询问：
@@ -44,9 +40,16 @@ sba uninstall
 - `sba update`：下载候选 DEB，预检配置后更新；失败时尝试回滚。
 - `sba uninstall`：只清理本项目拥有的资源。
 
+## 在线订阅
+
+- `http://服务器地址:订阅端口/sub/令牌`：Clash/Mihomo YAML，适用于 Clash Verge、Mihomo。
+- `http://服务器地址:订阅端口/sub/令牌/vless`：Base64 VLESS，适用于支持 VLESS URI 订阅的客户端。
+- 直接访问订阅端口根路径会返回 nginx `404 Not Found`。这是精确路径保护的预期行为，不代表端口不通。
+- 更新旧安装后，执行 `sba install` 重新配置。原订阅 URL、UUID、Reality 密钥和令牌保持不变。
+
 ## 防火墙
 
-脚本仅在 UFW 已启用时添加 Reality 和订阅 TCP 端口。云服务器安全组仍需手工放行对应端口。
+脚本仅在 UFW 已启用时添加 Reality 和订阅 TCP 端口。云服务器安全组或云防火墙仍需手工放行这两个 TCP 端口。
 
 ## 安全说明
 
@@ -63,7 +66,8 @@ sba uninstall
 /etc/singbox-agent/state.conf
 /etc/singbox-agent/vless-uri.txt
 /etc/singbox-agent/vless.png
-/var/lib/singbox-agent/www/subscription.txt
+/var/lib/singbox-agent/www/clash.yaml
+/var/lib/singbox-agent/www/vless.txt
 /etc/nginx/sites-available/singbox-agent-subscription
 /usr/local/bin/sba
 ```
