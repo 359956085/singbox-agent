@@ -137,7 +137,7 @@ PY
     fi
 
     qrencode() {
-        local output=""
+        local output="" content="${!#}"
         QRENCODE_ARGUMENTS="$(printf '%s ' "$@")"
         while (($#)); do
             if [[ "$1" == "-o" ]]; then
@@ -147,7 +147,11 @@ PY
                 shift
             fi
         done
-        printf 'PNG\n' >"$output"
+        if [[ -n "$output" ]]; then
+            printf 'PNG\n' >"$output"
+        else
+            printf '二维码内容=%s\n' "$content"
+        fi
     }
     original_app_dir="$APP_DIR"
     original_web_dir="$WEB_DIR"
@@ -166,7 +170,7 @@ PY
     assert_equal "Base64 解码严格等于 VLESS URI" "$(build_vless_uri)" "$decoded_uri"
     assert_true "客户端二维码已生成" test -s "$QR_FILE"
     assert_true "PNG 二维码使用紧凑尺寸" grep -Fq -- '-s 4 -m 1' <<<"$QRENCODE_ARGUMENTS"
-    assert_true "终端二维码使用紧凑边距" grep -Fq "qrencode -t ANSIUTF8 -m 1 \"\$uri\"" "${PROJECT_DIR}/install.sh"
+    assert_true "终端二维码使用紧凑边距" grep -Fq "qrencode -t ANSIUTF8 -m 1 \"\$vless_subscription_url\"" "${PROJECT_DIR}/install.sh"
     APP_DIR="$original_app_dir"
     WEB_DIR="$original_web_dir"
     URI_FILE="$original_uri_file"
@@ -289,6 +293,24 @@ write_state
 mkdir -p "$SINGBOX_DIR" "$(dirname "$NGINX_SITE_AVAILABLE")" "$(dirname "$NGINX_SITE_ENABLED")" "$WEB_DIR" "$MANAGER_DIR" "$(dirname "$COMMAND_LINK")"
 touch "$SINGBOX_CONFIG" "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED" "$WEB_CLASH_SUBSCRIPTION" \
     "$WEB_VLESS_SUBSCRIPTION" "$LEGACY_WEB_SUBSCRIPTION" "$URI_FILE" "$QR_FILE" "$MANAGER_FILE" "$COMMAND_LINK"
+if command -v jq >/dev/null 2>&1; then
+    sing-box() {
+        [[ "${1:-}" == "version" ]] && printf 'sing-box version 1.0.0\n'
+    }
+    show_result="$(show_configuration 2>&1)"
+    expected_uri="$(build_vless_uri)"
+    expected_vless_subscription="$(build_vless_subscription_url)"
+    expected_clash_subscription="$(build_clash_subscription_url)"
+    vless_group_line="$(grep -nF '===== VLESS / Shadowrocket =====' <<<"$show_result" | cut -d: -f1)"
+    clash_group_line="$(grep -nF '===== Clash / Mihomo =====' <<<"$show_result" | cut -d: -f1)"
+    assert_true "VLESS 分组显示在 Clash 分组之前" test "$vless_group_line" -lt "$clash_group_line"
+    assert_true "VLESS 分组显示原始单节点 URI" grep -Fxq "$expected_uri" <<<"$show_result"
+    assert_true "VLESS 分组显示 Base64 订阅" grep -Fxq "$expected_vless_subscription" <<<"$show_result"
+    assert_true "VLESS 分组标明单节点 PNG" grep -Fq "原始 VLESS 单节点二维码 PNG：${QR_FILE}" <<<"$show_result"
+    assert_true "终端二维码编码 VLESS 订阅 URL" grep -Fxq "二维码内容=${expected_vless_subscription}" <<<"$show_result"
+    assert_false "终端二维码不编码原始 VLESS URI" grep -Fxq "二维码内容=${expected_uri}" <<<"$show_result"
+    assert_equal "Clash URL 仅显示一次" "1" "$(grep -Fxc "$expected_clash_subscription" <<<"$show_result")"
+fi
 user_nginx_file="$(dirname "$NGINX_SITE_AVAILABLE")/user-site"
 printf '用户配置\n' >"$user_nginx_file"
 uninstall_command <<<'y'

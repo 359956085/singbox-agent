@@ -963,13 +963,17 @@ show_configuration() {
     printf 'Reality 目标：%s:%s\n' "$REALITY_HOST" "$REALITY_DEST_PORT"
     printf '公钥：%s\n' "$PUBLIC_KEY"
     printf 'short ID：%s\n' "$SHORT_ID"
-    printf '\nVLESS：\n%s\n' "$uri"
-    printf '\nClash/Mihomo 在线订阅：\n%s\n' "$clash_subscription_url"
-    printf '\nBase64 VLESS 在线订阅：\n%s\n' "$vless_subscription_url"
-    printf '\n二维码文件：%s\n\n' "$QR_FILE"
+    printf '\n%b===== VLESS / Shadowrocket =====%b\n' "$color_blue" "$color_reset"
+    printf '原始 VLESS 单节点 URI：\n%s\n' "$uri"
+    printf '\nBase64 VLESS 订阅 URL：\n%s\n' "$vless_subscription_url"
+    printf '\n原始 VLESS 单节点二维码 PNG：%s\n' "$QR_FILE"
+    printf '\nShadowrocket 订阅二维码：\n\n'
     if command_exists qrencode; then
-        qrencode -t ANSIUTF8 -m 1 "$uri" || warn "终端二维码生成失败。"
+        qrencode -t ANSIUTF8 -m 1 "$vless_subscription_url" || warn "终端二维码生成失败。"
     fi
+
+    printf '\n%b===== Clash / Mihomo =====%b\n' "$color_blue" "$color_reset"
+    printf 'YAML 订阅 URL：\n%s\n' "$clash_subscription_url"
     warn "在线订阅使用 HTTP。请把随机 URL 当作敏感凭据保存。"
 }
 

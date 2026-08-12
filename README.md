@@ -41,6 +41,8 @@ sba
 
 兼容原有命令：`sba install`、`sba show`、`sba update`、`sba uninstall`。
 
+查看配置时会分别显示 VLESS/Shadowrocket 与 Clash/Mihomo 订阅。终端二维码编码较短的 Base64 VLESS 订阅 URL；PNG 保留原始 VLESS 单节点二维码。
+
 ## 在线订阅
 
 - `http://服务器地址:订阅端口/sub/令牌`：Clash/Mihomo YAML，适用于 Clash Verge、Mihomo。
