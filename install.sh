@@ -739,7 +739,7 @@ write_client_artifacts() {
     chmod 600 "$uri_temp"
     mv -f -- "$uri_temp" "$URI_FILE"
     qr_temp="$(mktemp "${APP_DIR}/.qr.XXXXXX")"
-    qrencode -o "$qr_temp" -s 8 -m 2 "$uri"
+    qrencode -o "$qr_temp" -s 4 -m 1 "$uri"
     chmod 600 "$qr_temp"
     mv -f -- "$qr_temp" "$QR_FILE"
     clash_temp="$(mktemp "${WEB_DIR}/.clash.XXXXXX")"
@@ -968,7 +968,7 @@ show_configuration() {
     printf '\nBase64 VLESS 在线订阅：\n%s\n' "$vless_subscription_url"
     printf '\n二维码文件：%s\n\n' "$QR_FILE"
     if command_exists qrencode; then
-        qrencode -t ANSIUTF8 "$uri" || warn "终端二维码生成失败。"
+        qrencode -t ANSIUTF8 -m 1 "$uri" || warn "终端二维码生成失败。"
     fi
     warn "在线订阅使用 HTTP。请把随机 URL 当作敏感凭据保存。"
 }

@@ -138,6 +138,7 @@ PY
 
     qrencode() {
         local output=""
+        QRENCODE_ARGUMENTS="$(printf '%s ' "$@")"
         while (($#)); do
             if [[ "$1" == "-o" ]]; then
                 output="$2"
@@ -164,6 +165,8 @@ PY
     decoded_uri="$(base64 -d "$WEB_VLESS_SUBSCRIPTION")"
     assert_equal "Base64 解码严格等于 VLESS URI" "$(build_vless_uri)" "$decoded_uri"
     assert_true "客户端二维码已生成" test -s "$QR_FILE"
+    assert_true "PNG 二维码使用紧凑尺寸" grep -Fq -- '-s 4 -m 1' <<<"$QRENCODE_ARGUMENTS"
+    assert_true "终端二维码使用紧凑边距" grep -Fq "qrencode -t ANSIUTF8 -m 1 \"\$uri\"" "${PROJECT_DIR}/install.sh"
     APP_DIR="$original_app_dir"
     WEB_DIR="$original_web_dir"
     URI_FILE="$original_uri_file"
