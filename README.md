@@ -78,9 +78,9 @@ sba
 ## 本地检查
 
 ```bash
-bash -n install.sh
+bash -n install.sh tests/test.sh .github/scripts/sync-cnb.sh
 bash tests/test.sh
-shellcheck -x install.sh tests/test.sh
+shellcheck -x install.sh tests/test.sh .github/scripts/sync-cnb.sh
 ```
 
 集成验收需在全新 Debian 或 Ubuntu 虚拟机执行。不要在已有 sing-box 业务的机器上测试安装流程。

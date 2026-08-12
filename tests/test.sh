@@ -322,4 +322,47 @@ assert_false "卸载删除旧订阅文件" test -e "$LEGACY_WEB_SUBSCRIPTION"
 assert_false "卸载删除状态目录" test -e "$APP_DIR"
 assert_true "卸载保留用户 nginx 配置" test -e "$user_nginx_file"
 
+# 使用 Git 命令替身验证 CNB 同步边界，避免测试访问网络。
+sync_script="${PROJECT_DIR}/.github/scripts/sync-cnb.sh"
+sync_test_dir="${TEST_SANDBOX}/sync-cnb"
+mock_bin="${sync_test_dir}/bin"
+git_calls="${sync_test_dir}/git-calls.log"
+mkdir -p "$mock_bin" "${sync_test_dir}/runner"
+cat >"${mock_bin}/git" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GIT_CALLS:?}"
+case "${1:-} ${2:-}" in
+    "remote get-url") exit 1 ;;
+    "fetch --no-tags") exit 1 ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod 700 "${mock_bin}/git"
+PATH="${mock_bin}:${PATH}" GIT_CALLS="$git_calls" RUNNER_TEMP="${sync_test_dir}/runner" \
+    CNB_TOKEN="测试令牌" bash "$sync_script" >/dev/null
+assert_true "CNB remote 不包含令牌" grep -Fxq 'remote add cnb https://cnb.cool/359956085/singbox-agent' "$git_calls"
+assert_false "CNB Token 不进入 Git 参数" grep -Fq '测试令牌' "$git_calls"
+assert_true "CNB 仅推送 HEAD 到 main" grep -Fxq 'push cnb HEAD:refs/heads/main' "$git_calls"
+assert_false "CNB 同步禁止强制推送" grep -Eq -- '--force|--mirror' "$git_calls"
+assert_equal "CNB 临时认证脚本已清理" "" "$(find "${sync_test_dir}/runner" -type f -print -quit)"
+
+: >"$git_calls"
+cat >"${mock_bin}/git" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GIT_CALLS:?}"
+case "${1:-} ${2:-}" in
+    "merge-base --is-ancestor") exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+chmod 700 "${mock_bin}/git"
+PATH="${mock_bin}:${PATH}" GIT_CALLS="$git_calls" RUNNER_TEMP="${sync_test_dir}/runner" \
+    CNB_TOKEN="测试令牌" bash "$sync_script" >/dev/null
+assert_false "CNB 已包含提交时不重复推送" grep -Eq '^push ' "$git_calls"
+
+workflow_file="${PROJECT_DIR}/.github/workflows/shell.yml"
+assert_true "CNB 同步依赖代码检查" grep -Fq 'needs: test' "$workflow_file"
+assert_true "CNB 仅同步 main push" grep -Fq "if: github.event_name == 'push' && github.ref == 'refs/heads/main'" "$workflow_file"
+assert_true "工作流从 Secret 注入 CNB Token" grep -Fq "CNB_TOKEN: \${{ secrets.CNB_TOKEN }}" "$workflow_file"
+
 printf '完成：%s 项测试通过。\n' "$passed"

@@ -16,8 +16,24 @@ jobs:
       - name: 安装检查工具
         run: sudo apt-get update && sudo apt-get install -y jq shellcheck python3-yaml
       - name: Bash 语法检查
-        run: bash -n install.sh tests/test.sh
+        run: bash -n install.sh tests/test.sh .github/scripts/sync-cnb.sh
       - name: ShellCheck
-        run: shellcheck -x install.sh tests/test.sh
+        run: shellcheck -x install.sh tests/test.sh .github/scripts/sync-cnb.sh
       - name: 执行测试
         run: bash tests/test.sh
+
+  sync-cnb:
+    name: 同步到 CNB
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出完整历史
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 同步 main 到 CNB
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_REPOSITORY_URL: https://cnb.cool/359956085/singbox-agent
+        run: bash .github/scripts/sync-cnb.sh
