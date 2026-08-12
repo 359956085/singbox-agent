@@ -29,16 +29,17 @@ apt-get update && apt-get install -y wget ca-certificates && wget -O /tmp/singbo
 
 ```bash
 sba
-sba show
-sba update
-sba uninstall
 ```
 
-- `sba`：打开菜单。
-- `sba install`：重新配置，保留 UUID、Reality 密钥和订阅令牌。
-- `sba show`：显示链接、二维码、服务状态和订阅 URL。
-- `sba update`：下载候选 DEB，预检配置后更新；失败时尝试回滚。
-- `sba uninstall`：只清理本项目拥有的资源。
+`sba` 打开交互式管理菜单：
+
+1. 安装或重新配置。
+2. 查看配置与二维码。
+3. 更新 sing-box。
+4. 卸载。
+0. 退出。
+
+兼容原有命令：`sba install`、`sba show`、`sba update`、`sba uninstall`。
 
 ## 在线订阅
 

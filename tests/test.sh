@@ -181,6 +181,87 @@ else
     printf '跳过：未安装 jq，无法测试 URI 和配置渲染。\n'
 fi
 
+# 使用命令替身验证菜单循环、选项映射与旧子命令兼容性。
+menu_result="$(
+    (
+        calls=""
+        show_command() { calls+="2"; }
+        update_command() { calls+="3"; }
+        menu_command
+        printf '调用=%s\n' "$calls"
+    ) 2>&1 <<'EOF'
+9
+2
+
+3
+
+0
+EOF
+)"
+assert_true "菜单无效输入后继续运行" grep -Fq '无效选项，请重新选择。' <<<"$menu_result"
+assert_true "查看和更新后返回菜单" grep -Fxq '调用=23' <<<"$menu_result"
+
+menu_install_result="$(
+    (
+        calls=""
+        install_command() { calls+="1"; }
+        show_command() { calls+="2"; }
+        menu_command
+        printf '调用=%s\n' "$calls"
+    ) <<'EOF'
+1
+2
+EOF
+)"
+assert_true "安装完成后退出菜单" grep -Fxq '调用=1' <<<"$menu_install_result"
+
+menu_uninstall_cancel_result="$(
+    (
+        calls=""
+        STATE_FILE="${TEST_SANDBOX}/menu-state"
+        : >"$STATE_FILE"
+        uninstall_command() { calls+="4"; }
+        menu_command
+        printf '调用=%s\n' "$calls"
+    ) <<'EOF'
+4
+0
+EOF
+)"
+assert_true "取消卸载后返回菜单" grep -Fxq '调用=4' <<<"$menu_uninstall_cancel_result"
+
+menu_uninstall_success_result="$(
+    (
+        calls=""
+        STATE_FILE="${TEST_SANDBOX}/menu-state-success"
+        : >"$STATE_FILE"
+        uninstall_command() { calls+="4"; rm -f -- "$STATE_FILE"; }
+        show_command() { calls+="2"; }
+        menu_command
+        printf '调用=%s\n' "$calls"
+    ) <<'EOF'
+4
+2
+EOF
+)"
+assert_true "卸载成功后退出菜单" grep -Fxq '调用=4' <<<"$menu_uninstall_success_result"
+
+subcommand_result="$(
+    (
+        calls=""
+        install_command() { calls+="1"; }
+        show_command() { calls+="2"; }
+        update_command() { calls+="3"; }
+        uninstall_command() { calls+="4"; }
+        main install
+        main show
+        main update
+        main uninstall
+        printf '%s' "$calls"
+    )
+)"
+assert_equal "保留四个管理子命令" "1234" "$subcommand_result"
+
 # 使用临时根目录和命令替身验证卸载边界。
 require_root() { :; }
 systemctl() { :; }

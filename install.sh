@@ -1091,18 +1091,39 @@ print_menu() {
     printf '0. 退出\n'
 }
 
+pause_menu() {
+    read -r -p "按回车返回主菜单：" || true
+}
+
 menu_command() {
     local choice
-    print_menu
-    read -r -p "请选择：" choice
-    case "$choice" in
-        1) install_command ;;
-        2) show_command ;;
-        3) update_command ;;
-        4) uninstall_command ;;
-        0) return ;;
-        *) fatal "无效选项。" ;;
-    esac
+    while true; do
+        print_menu
+        if ! read -r -p "请选择：" choice; then
+            printf '\n'
+            return
+        fi
+        case "$choice" in
+            1)
+                install_command
+                return
+                ;;
+            2)
+                show_command
+                pause_menu
+                ;;
+            3)
+                update_command
+                pause_menu
+                ;;
+            4)
+                uninstall_command
+                [[ -e "$STATE_FILE" ]] || return
+                ;;
+            0) return ;;
+            *) warn "无效选项，请重新选择。" ;;
+        esac
+    done
 }
 
 usage() {
