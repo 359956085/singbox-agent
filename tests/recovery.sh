@@ -55,6 +55,8 @@ command_exists() {
     fi
 }
 systemctl() {
+    printf '%s ' "$@" >>"$SBA_ROOT/mock/systemctl.log"
+    printf '\n' >>"$SBA_ROOT/mock/systemctl.log"
     case "$1" in
         is-active) [[ -f "$SBA_ROOT/mock/${!#}.active" ]] ;;
         is-enabled) [[ -f "$SBA_ROOT/mock/${!#}.enabled" ]] ;;
@@ -76,6 +78,19 @@ dpkg-query() {
     [[ -f "$SBA_ROOT/mock/package" ]] || return 1
     printf 'install ok installed'
 }
+wait_for_test_signal() {
+    # 由阻塞子进程报告就绪，避免 Ctrl+C 到达后 Bash 才启动 sleep。
+    # 显式恢复默认信号处理，避免测试替身继承忽略 SIGINT 的状态。
+    python3 - "$1" <<'PYWAIT'
+import signal
+import sys
+
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, signal.SIG_DFL)
+print(sys.argv[1], flush=True)
+signal.pause()
+PYWAIT
+}
 apt-get() {
     local IFS=' '
     printf '%s\n' "$*" >>"$SBA_ROOT/mock/apt.log"
@@ -86,8 +101,7 @@ apt-get() {
         'install -y sing-box')
             touch "$SBA_ROOT/mock/package"
             if [[ "${WAIT_PACKAGE:-0}" == 1 ]]; then
-                printf 'PACKAGE_READY\n'
-                sleep 30
+                wait_for_test_signal PACKAGE_READY
             fi ;;
         *) : ;;
     esac
@@ -219,14 +233,15 @@ case "$action" in
         [[ ! -e "$SBA_ROOT/mock/generated" ]]
         [[ "$(state_get UUID)" == "$UUID" && "$(state_get PRIVATE_KEY)" == "$PRIVATE_KEY" && "$(state_get SUBSCRIPTION_TOKEN)" == "$SUBSCRIPTION_TOKEN" ]] ;;
     exit-uncommitted) begin_transaction; exit 0 ;;
-    kill-uncommitted) begin_transaction; printf 'TRANSACTION_READY\n'; sleep 30 ;;
+    signal-uninstalled) begin_transaction; kill -INT "$BASHPID" ;;
+    kill-uncommitted) begin_transaction; wait_for_test_signal TRANSACTION_READY ;;
     commit|commit-signal|commit-cleanup-interrupted)
         begin_transaction
         mkdir -p "$APP_DIR" "$(dirname "$COMMAND_LINK")"
         touch "$STATE_FILE" "$COMMAND_LINK"
         TX_PHASE=committed
         write_transaction
-        if [[ "$action" == commit-signal ]]; then handle_error 130 "$LINENO"; fi
+        if [[ "$action" == commit-signal ]]; then kill -INT "$BASHPID"; fi
         if [[ "$action" == commit-cleanup-interrupted ]]; then mv "$TX_DIR" "${TRANSACTION_DIR}.cleanup"; fi
         # 模拟写提交标记后、清理前进程消失。
         ROLLBACK_ACTIVE=0 ;;
@@ -264,7 +279,7 @@ case "$action" in
         printf 'original-config\n' >"$SINGBOX_CONFIG"
         begin_transaction
         result="$(false)" ;;
-    lock-wait) acquire_install_lock; printf 'LOCK_READY\n'; sleep 30 ;;
+    lock-wait) acquire_install_lock; wait_for_test_signal LOCK_READY ;;
     lock-once) acquire_install_lock ;;
     prompt|install)
         if [[ "${FAIL_PURGE:-0}" == 1 ]]; then
@@ -310,6 +325,8 @@ check '重新配置失败恢复旧状态和凭据' cmp "$TEST_SANDBOX/reconfigur
 check '重新配置失败保留原服务运行状态' test -f "$TEST_SANDBOX/reconfigure-fail/mock/sing-box.service.active"
 run_case "$TEST_SANDBOX/exit" exit-uncommitted 1
 check '正常退出但未提交也执行回滚' test ! -e "$TEST_SANDBOX/exit/var/lib/singbox-agent/transaction"
+run_case "$TEST_SANDBOX/signal-uninstalled" signal-uninstalled 130
+check 'SIGINT 回滚时缺失的服务不会误报恢复失败' test ! -e "$TEST_SANDBOX/signal-uninstalled/var/lib/singbox-agent/transaction"
 run_case "$TEST_SANDBOX/commit" commit 0
 run_case "$TEST_SANDBOX/commit" cleanup-committed 0
 check '提交后恢复只清理备份' test ! -e "$TEST_SANDBOX/commit/var/lib/singbox-agent/transaction"
@@ -344,6 +361,7 @@ import select
 import signal
 import subprocess
 import sys
+import termios
 import time
 
 harness, project, sandbox = sys.argv[1:]
@@ -352,6 +370,9 @@ def launch(root, action, marker=None, sig=signal.SIGINT, **extra):
     env = dict(os.environ, PROJECT_DIR=project, SBA_ROOT=str(root), **extra)
     pid, fd = pty.fork()
     if pid == 0:
+        # 非交互父进程可能忽略 SIGINT；exec 前恢复，保证 Bash 能安装 trap。
+        for inherited_sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(inherited_sig, signal.SIG_DFL)
         os.execvpe("bash", ["bash", harness, action], env)
     output = b""
     sent = marker is None
@@ -366,17 +387,41 @@ def launch(root, action, marker=None, sig=signal.SIGINT, **extra):
                     if exc.errno != errno.EIO:
                         raise
             if not sent and marker in output:
-                if sig == signal.SIGINT:
-                    os.write(fd, b"\x03")
-                else:
-                    os.killpg(pid, sig)
-                sent = True
+                # 提示输出不代表 read/wait 已开始；在运行态发送 INT 可能被 Bash
+                # 延后到下一次输入之后。等内核确认已阻塞，再发送终端信号。
+                process_status = pathlib.Path(f"/proc/{pid}/status").read_text()
+                sleeping = any(line.startswith("State:\tS") for line in process_status.splitlines())
+                if sleeping:
+                    if sig == signal.SIGINT:
+                        os.write(fd, b"\x03")
+                    else:
+                        os.killpg(pid, sig)
+                    sent = True
             waited, status_now = os.waitpid(pid, os.WNOHANG)
             if waited:
                 status = status_now
+                # waitpid 可能先于最后一批终端输出到达；保留回滚诊断。
+                while select.select([fd], [], [], 0)[0]:
+                    try:
+                        tail = os.read(fd, 65536)
+                    except OSError as exc:
+                        if exc.errno != errno.EIO:
+                            raise
+                        break
+                    if not tail:
+                        break
+                    output += tail
                 break
-        assert status is not None, output.decode(errors="replace")
-        assert sent, output.decode(errors="replace")
+        if status is None:
+            tty = termios.tcgetattr(fd)
+            process_status = pathlib.Path(f"/proc/{pid}/status").read_text()
+            signal_status = "\n".join(line for line in process_status.splitlines() if line.startswith("Sig"))
+            raise AssertionError(
+                f"{action}: signal={sig}, sent={sent}, foreground_pgid={os.tcgetpgrp(fd)}, "
+                f"child_pid={pid}, ISIG={bool(tty[3] & termios.ISIG)}, VINTR={tty[6][termios.VINTR]!r}\n"
+                f"{signal_status}\n{output.decode(errors='replace')}"
+            )
+        assert sent, f"{action}: missing marker {marker!r}\n{output.decode(errors='replace')}"
         return os.waitstatus_to_exitcode(status), output
     finally:
         if status is None:
@@ -396,8 +441,12 @@ for sig, expected in [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHU
     root = pathlib.Path(sandbox) / f"pty-package-{sig}"
     code, out = launch(root, "install", b"PACKAGE_READY", sig, WAIT_PACKAGE="1")
     assert code == expected, (code, out)
-    assert not (root / "mock/package").exists()
-    assert not (root / "var/lib/singbox-agent/transaction").exists()
+    assert not (root / "mock/package").exists(), out.decode(errors="replace")
+    assert not (root / "var/lib/singbox-agent/transaction").exists(), (
+        out.decode(errors="replace"),
+        (root / "var/lib/singbox-agent/transaction/record.conf").read_text(),
+        (root / "mock/systemctl.log").read_text(),
+    )
     assert launch(root, "install")[0] == 0
     assert (root / "usr/local/bin/sba").exists()
 

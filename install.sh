@@ -244,8 +244,9 @@ restore_service() {
     local service="$1" active="$2" enabled="$3"
     # 尚未安装的软件包没有服务单元，无需执行 stop/disable。
     if ! systemctl cat "$service" >/dev/null 2>&1; then
-        [[ "$active" == 0 && "$enabled" == 0 ]]
-        return
+        [[ "$active" == 0 && "$enabled" == 0 ]] || return 1
+        # 信号 trap 内无参数 return 会沿用信号退出码，必须明确返回成功。
+        return 0
     fi
     if [[ "$enabled" == 1 ]]; then
         systemctl enable "$service" >/dev/null || return 1
@@ -283,8 +284,8 @@ rollback_transaction() {
     ROLLBACK_ACTIVE=0
     # 提交记录已落盘、内存标志尚未更新时收到信号，也不能撤销成功安装。
     if grep -Fxq 'PHASE=committed' "${TX_DIR}/record.conf"; then
-        cleanup_transaction
-        return
+        cleanup_transaction || return 1
+        return 0
     fi
     # Bash 会等待前台子进程退出后处理信号；回滚不再被重复 Ctrl+C 打断。
     trap '' INT TERM HUP
