@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 readonly STATE_VERSION="1"
 readonly OFFICIAL_KEY_URL="https://sing-box.app/gpg.key"
 readonly OFFICIAL_REPO_URL="https://deb.sagernet.org/"
@@ -31,6 +31,8 @@ COMMAND_LINK="${ROOT_PREFIX}/usr/local/bin/sba"
 APT_KEY_FILE="${ROOT_PREFIX}/etc/apt/keyrings/sagernet.asc"
 APT_SOURCE_FILE="${ROOT_PREFIX}/etc/apt/sources.list.d/sagernet.sources"
 CACHE_DIR="${ROOT_PREFIX}/var/cache/singbox-agent"
+TRANSACTION_DIR="${ROOT_PREFIX}/var/lib/singbox-agent/transaction"
+INSTALL_LOCK="${ROOT_PREFIX}/run/lock/singbox-agent.lock"
 
 ROLLBACK_ACTIVE=0
 TX_DIR=""
@@ -42,6 +44,134 @@ TX_APT_SOURCE_CREATED=0
 UPDATE_TEMP_DIR=""
 TX_SINGBOX_WAS_ACTIVE=0
 TX_NGINX_WAS_ACTIVE=0
+TX_SINGBOX_WAS_ENABLED=0
+TX_NGINX_WAS_ENABLED=0
+TX_PHASE="pending"
+INSTALL_LOCK_FD=""
+TRAP_OWNER_PID="$BASHPID"
+
+# 固定资源名称；恢复记录不包含可执行代码或任意目标路径。
+transaction_paths() {
+    printf '%s\n' "$SINGBOX_CONFIG" "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED" \
+        "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION" "$LEGACY_WEB_SUBSCRIPTION" \
+        "$URI_FILE" "$QR_FILE" "$STATE_FILE" "$MANAGER_FILE" "$COMMAND_LINK" \
+        "${SINGBOX_DIR}/.singbox-agent-config.tmp" "${APP_DIR}/.singbox-agent-state.tmp" \
+        "${APP_DIR}/.singbox-agent-uri.tmp" "${APP_DIR}/.singbox-agent-qr.tmp" \
+        "${WEB_DIR}/.singbox-agent-clash.tmp" "${WEB_DIR}/.singbox-agent-vless.tmp" \
+        "$(dirname "$NGINX_SITE_AVAILABLE")/.singbox-agent-nginx.tmp"
+}
+
+transaction_names() {
+    printf '%s\n' singbox-config nginx-site nginx-link clash-subscription vless-subscription \
+        legacy-subscription uri qr state manager command-link \
+        temp-config temp-state temp-uri temp-qr temp-clash temp-vless temp-nginx
+}
+
+artifact_temp() {
+    local directory="$1" name="$2" path
+    if [[ "$ROLLBACK_ACTIVE" == 1 ]]; then
+        # 固定暂存路径已随事务备份；同目录 mv 保持原子替换，回滚也能清理半成品。
+        path="${directory}/.singbox-agent-${name}.tmp"
+        rm -f -- "$path" || return 1
+        (umask 077; : >"$path") || return 1
+        printf '%s' "$path"
+    else
+        mktemp "${directory}/.${name}.XXXXXX" || return 1
+    fi
+}
+
+acquire_install_lock() {
+    command_exists flock || fatal "未找到 flock，请先安装 util-linux。"
+    mkdir -p -- "$(dirname "$INSTALL_LOCK")"
+    exec {INSTALL_LOCK_FD}>"$INSTALL_LOCK"
+    flock -n "$INSTALL_LOCK_FD" || fatal "已有安装或恢复正在运行，请稍后重试。"
+}
+
+release_install_lock() {
+    if [[ -n "$INSTALL_LOCK_FD" ]]; then
+        exec {INSTALL_LOCK_FD}>&-
+        INSTALL_LOCK_FD=""
+    fi
+}
+
+write_transaction() {
+    local temp
+    temp="$(mktemp "${TX_DIR}/.record.XXXXXX")" || return 1
+    {
+        printf 'VERSION=1\nPHASE=%s\n' "$TX_PHASE"
+        printf 'TX_SINGBOX_INSTALLED=%s\n' "$TX_SINGBOX_INSTALLED"
+        printf 'TX_APT_KEY_CREATED=%s\n' "$TX_APT_KEY_CREATED"
+        printf 'TX_APT_SOURCE_CREATED=%s\n' "$TX_APT_SOURCE_CREATED"
+        printf 'TX_UFW_REALITY_ADDED=%s\n' "$TX_UFW_REALITY_ADDED"
+        printf 'TX_UFW_SUBSCRIPTION_ADDED=%s\n' "$TX_UFW_SUBSCRIPTION_ADDED"
+        printf 'TX_SINGBOX_WAS_ACTIVE=%s\n' "$TX_SINGBOX_WAS_ACTIVE"
+        printf 'TX_NGINX_WAS_ACTIVE=%s\n' "$TX_NGINX_WAS_ACTIVE"
+        printf 'TX_SINGBOX_WAS_ENABLED=%s\n' "$TX_SINGBOX_WAS_ENABLED"
+        printf 'TX_NGINX_WAS_ENABLED=%s\n' "$TX_NGINX_WAS_ENABLED"
+        printf 'REALITY_PORT=%s\nSUBSCRIPTION_PORT=%s\n' "$REALITY_PORT" "$SUBSCRIPTION_PORT"
+    } >"$temp" || return 1
+    chmod 600 "$temp" || return 1
+    mv -f -- "$temp" "${TX_DIR}/record.conf"
+}
+
+load_transaction() {
+    local key value name
+    local -A seen=()
+    [[ -f "${TX_DIR}/record.conf" && ! -L "${TX_DIR}/record.conf" ]] || return 1
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^[A-Z_]+$ ]] || return 1
+        [[ -z "${seen[$key]:-}" ]] || return 1
+        seen[$key]=1
+        case "$key" in
+            VERSION) [[ "$value" == 1 ]] || return 1 ;;
+            PHASE)
+                [[ "$value" == pending || "$value" == committed ]] || return 1
+                TX_PHASE="$value" ;;
+            TX_SINGBOX_INSTALLED|TX_APT_KEY_CREATED|TX_APT_SOURCE_CREATED|TX_UFW_REALITY_ADDED|TX_UFW_SUBSCRIPTION_ADDED|TX_SINGBOX_WAS_ACTIVE|TX_NGINX_WAS_ACTIVE|TX_SINGBOX_WAS_ENABLED|TX_NGINX_WAS_ENABLED)
+                [[ "$value" == 0 || "$value" == 1 ]] || return 1
+                printf -v "$key" '%s' "$value" ;;
+            REALITY_PORT|SUBSCRIPTION_PORT)
+                [[ ${#value} -le 5 ]] || return 1
+                validate_port "$value" || return 1
+                printf -v "$key" '%s' "$value" ;;
+            *) return 1 ;;
+        esac
+    done <"${TX_DIR}/record.conf"
+    [[ "${#seen[@]}" == 13 ]] || return 1
+    if [[ "$TX_PHASE" == pending ]]; then
+        while IFS= read -r name; do
+            if [[ -f "${TX_DIR}/${name}.exists" && ! -L "${TX_DIR}/${name}.exists" ]]; then
+                [[ -e "${TX_DIR}/${name}" || -L "${TX_DIR}/${name}" ]] || return 1
+            elif [[ ! -f "${TX_DIR}/${name}.absent" || -L "${TX_DIR}/${name}.absent" ]]; then
+                return 1
+            fi
+        done < <(transaction_names)
+    fi
+}
+
+install_traps() {
+    TRAP_OWNER_PID="$BASHPID"
+    trap 'handle_error $? $LINENO' ERR
+    trap 'handle_error 130 $LINENO' INT
+    trap 'handle_error 143 $LINENO' TERM
+    trap 'handle_error 129 $LINENO' HUP
+    trap 'handle_exit $?' EXIT
+}
+
+recover_transaction() {
+    cleanup_retired_transaction || fatal "无法清理已恢复或已提交的事务备份：${TRANSACTION_DIR}.cleanup。"
+    [[ -e "$TRANSACTION_DIR" || -L "$TRANSACTION_DIR" ]] || return 0
+    [[ -d "$TRANSACTION_DIR" && ! -L "$TRANSACTION_DIR" ]] || fatal "恢复目录异常：${TRANSACTION_DIR}。"
+    TX_DIR="$TRANSACTION_DIR"
+    load_transaction || fatal "恢复记录不完整或无效，已保留：${TX_DIR}。"
+    if [[ "$TX_PHASE" == committed ]]; then
+        cleanup_transaction || fatal "无法清理已提交的事务备份：${TX_DIR}。"
+    else
+        info "发现未完成的安装，先恢复上次修改。"
+        ROLLBACK_ACTIVE=1
+        rollback_transaction || fatal "恢复失败，请处理上述失败项后再次执行安装。"
+    fi
+}
 
 color_red='\033[31m'
 color_green='\033[32m'
@@ -55,10 +185,22 @@ warn() { printf "%b[警告]%b %s\n" "$color_yellow" "$color_reset" "$*" >&2; }
 error() { printf "%b[错误]%b %s\n" "$color_red" "$color_reset" "$*" >&2; }
 
 cleanup_transaction() {
-    if [[ -n "$TX_DIR" && "$TX_DIR" == /tmp/singbox-agent.* && -d "$TX_DIR" ]]; then
-        rm -rf -- "$TX_DIR"
+    if [[ -n "$TX_DIR" && "$TX_DIR" == "$TRANSACTION_DIR" && -d "$TX_DIR" && ! -L "$TX_DIR" ]]; then
+        cleanup_retired_transaction || return 1
+        # 先移出恢复入口；删除备份时再次被强制终止，不会留下半份有效事务。
+        mv -- "$TX_DIR" "${TRANSACTION_DIR}.cleanup" || return 1
+    else
+        return 1
     fi
     TX_DIR=""
+    cleanup_retired_transaction
+}
+
+cleanup_retired_transaction() {
+    local retired="${TRANSACTION_DIR}.cleanup"
+    [[ -e "$retired" || -L "$retired" ]] || return 0
+    [[ -d "$retired" && ! -L "$retired" ]] || return 1
+    rm -rf -- "$retired"
 }
 
 cleanup_update_temp() {
@@ -72,66 +214,125 @@ backup_path() {
     local path="$1"
     local name="$2"
     if [[ -e "$path" || -L "$path" ]]; then
-        : >"${TX_DIR}/${name}.exists"
         cp -a -- "$path" "${TX_DIR}/${name}"
+        : >"${TX_DIR}/${name}.exists"
+    else
+        : >"${TX_DIR}/${name}.absent"
     fi
 }
 
 restore_path() {
     local path="$1"
     local name="$2"
-    rm -f -- "$path"
+    rm -f -- "$path" || return 1
     if [[ -f "${TX_DIR}/${name}.exists" ]]; then
-        mkdir -p -- "$(dirname "$path")"
+        mkdir -p -- "$(dirname "$path")" || return 1
         cp -a -- "${TX_DIR}/${name}" "$path"
     fi
 }
 
+rollback_step() {
+    local label="$1"
+    shift
+    if ! "$@"; then
+        error "恢复失败：${label}。"
+        TX_ROLLBACK_FAILED=1
+    fi
+}
+
+restore_service() {
+    local service="$1" active="$2" enabled="$3"
+    # 尚未安装的软件包没有服务单元，无需执行 stop/disable。
+    if ! systemctl cat "$service" >/dev/null 2>&1; then
+        [[ "$active" == 0 && "$enabled" == 0 ]]
+        return
+    fi
+    if [[ "$enabled" == 1 ]]; then
+        systemctl enable "$service" >/dev/null || return 1
+    else
+        systemctl disable "$service" >/dev/null || return 1
+    fi
+    if [[ "$active" == 1 ]]; then
+        if [[ "$service" == nginx.service ]]; then
+            nginx -t || return 1
+            if systemctl is-active --quiet "$service"; then
+                systemctl reload "$service"
+            else
+                systemctl start "$service"
+            fi
+        else
+            systemctl restart "$service"
+        fi
+    else
+        systemctl stop "$service"
+    fi
+}
+
+rollback_ufw_rule() {
+    local port="$1"
+    command_exists ufw || return 1
+    if ufw_has_rule "$port"; then
+        ufw --force delete allow "${port}/tcp"
+    fi
+}
+
 rollback_transaction() {
+    local path index=0 package_removed=1
+    local -a names
     [[ "$ROLLBACK_ACTIVE" == "1" ]] || return 0
     ROLLBACK_ACTIVE=0
-    set +e
+    # 提交记录已落盘、内存标志尚未更新时收到信号，也不能撤销成功安装。
+    if grep -Fxq 'PHASE=committed' "${TX_DIR}/record.conf"; then
+        cleanup_transaction
+        return
+    fi
+    # Bash 会等待前台子进程退出后处理信号；回滚不再被重复 Ctrl+C 打断。
+    trap '' INT TERM HUP
+    trap - ERR
+    TX_ROLLBACK_FAILED=0
     warn "操作失败，正在恢复本项目修改。"
-    restore_path "$SINGBOX_CONFIG" "singbox-config"
-    restore_path "$NGINX_SITE_AVAILABLE" "nginx-site"
-    restore_path "$NGINX_SITE_ENABLED" "nginx-link"
-    restore_path "$WEB_CLASH_SUBSCRIPTION" "clash-subscription"
-    restore_path "$WEB_VLESS_SUBSCRIPTION" "vless-subscription"
-    restore_path "$LEGACY_WEB_SUBSCRIPTION" "legacy-subscription"
-    restore_path "$URI_FILE" "uri"
-    restore_path "$QR_FILE" "qr"
-    restore_path "$STATE_FILE" "state"
-    restore_path "$MANAGER_FILE" "manager"
-    restore_path "$COMMAND_LINK" "command-link"
-    rmdir "$WEB_DIR" "$(dirname "$WEB_DIR")" "$APP_DIR" "$MANAGER_DIR" 2>/dev/null
+    mapfile -t names < <(transaction_names)
+    while IFS= read -r path; do
+        rollback_step "$path" restore_path "$path" "${names[$index]}"
+        index=$((index + 1))
+    done < <(transaction_paths)
+    rmdir "$WEB_DIR" "$(dirname "$WEB_DIR")" "$APP_DIR" "$MANAGER_DIR" 2>/dev/null || true
     if [[ "$TX_UFW_REALITY_ADDED" == "1" && -n "${REALITY_PORT:-}" ]]; then
-        ufw --force delete allow "${REALITY_PORT}/tcp" >/dev/null 2>&1
+        rollback_step "UFW ${REALITY_PORT}/tcp" rollback_ufw_rule "$REALITY_PORT"
     fi
     if [[ "$TX_UFW_SUBSCRIPTION_ADDED" == "1" && -n "${SUBSCRIPTION_PORT:-}" ]]; then
-        ufw --force delete allow "${SUBSCRIPTION_PORT}/tcp" >/dev/null 2>&1
+        rollback_step "UFW ${SUBSCRIPTION_PORT}/tcp" rollback_ufw_rule "$SUBSCRIPTION_PORT"
     fi
-    if [[ "$TX_SINGBOX_INSTALLED" == "1" ]]; then
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y sing-box >/dev/null 2>&1
+    if [[ "$TX_SINGBOX_INSTALLED" == "1" ]] && dpkg-query -W sing-box >/dev/null 2>&1; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 purge -y sing-box; then
+            error "恢复失败：卸载本次安装的 sing-box；保留 APT 源、密钥和恢复记录。"
+            TX_ROLLBACK_FAILED=1
+            package_removed=0
+        fi
     fi
-    [[ "$TX_APT_SOURCE_CREATED" == "1" ]] && rm -f -- "$APT_SOURCE_FILE"
-    [[ "$TX_APT_KEY_CREATED" == "1" ]] && rm -f -- "$APT_KEY_FILE"
-    if [[ "$TX_SINGBOX_WAS_ACTIVE" == "1" ]]; then
-        systemctl restart sing-box.service >/dev/null 2>&1
-    else
-        systemctl stop sing-box.service >/dev/null 2>&1
+    if [[ "$package_removed" == 1 ]]; then
+        if [[ "$TX_APT_SOURCE_CREATED" == 1 ]]; then
+            rollback_step "$APT_SOURCE_FILE" rm -f -- "$APT_SOURCE_FILE"
+        fi
+        if [[ "$TX_APT_KEY_CREATED" == 1 ]]; then
+            rollback_step "$APT_KEY_FILE" rm -f -- "$APT_KEY_FILE"
+        fi
     fi
-    if [[ "$TX_NGINX_WAS_ACTIVE" == "1" ]]; then
-        nginx -t >/dev/null 2>&1 && systemctl reload nginx.service >/dev/null 2>&1
-    else
-        systemctl stop nginx.service >/dev/null 2>&1
+    rollback_step "sing-box 服务状态" restore_service sing-box.service "$TX_SINGBOX_WAS_ACTIVE" "$TX_SINGBOX_WAS_ENABLED"
+    rollback_step "nginx 服务状态" restore_service nginx.service "$TX_NGINX_WAS_ACTIVE" "$TX_NGINX_WAS_ENABLED"
+    if [[ "$TX_ROLLBACK_FAILED" == 0 ]]; then
+        rollback_step "清理事务备份" cleanup_transaction
     fi
-    cleanup_transaction
-    set -e
+    install_traps
+    if [[ "$TX_ROLLBACK_FAILED" != 0 ]]; then
+        error "恢复记录或备份已保留：${TX_DIR:-${TRANSACTION_DIR}.cleanup}；处理失败项后重新执行安装。"
+        return 1
+    fi
 }
 
 fatal() {
     error "$*"
-    rollback_transaction
+    rollback_transaction || true
     cleanup_update_temp
     exit 1
 }
@@ -139,8 +340,26 @@ fatal() {
 handle_error() {
     local code="$1"
     local line="$2"
+    # ERR 会继承到命令替换；子 shell 只传播失败，由父 shell 执行一次回滚。
+    if [[ "$BASHPID" != "$TRAP_OWNER_PID" ]]; then
+        trap - EXIT
+        exit "$code"
+    fi
     error "第 ${line} 行执行失败，退出码：${code}"
-    rollback_transaction
+    rollback_transaction || true
+    cleanup_update_temp
+    exit "$code"
+}
+
+handle_exit() {
+    local code="$1"
+    trap - EXIT
+    [[ "$BASHPID" == "$TRAP_OWNER_PID" ]] || exit "$code"
+    if [[ "$ROLLBACK_ACTIVE" == 1 ]]; then
+        [[ "$code" != 0 ]] || code=1
+        rollback_transaction || true
+    fi
+    trap - EXIT
     cleanup_update_temp
     exit "$code"
 }
@@ -244,7 +463,18 @@ validate_node_name() {
 
 port_in_use() {
     local port="$1"
-    ss -H -ltn 2>/dev/null | awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit !found }'
+    local hex file
+    local -a tables=()
+    if command_exists ss; then
+        ss -H -ltn | awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit !found }'
+    else
+        printf -v hex '%04X' "$port"
+        for file in /proc/net/tcp /proc/net/tcp6; do
+            [[ ! -r "$file" ]] || tables+=("$file")
+        done
+        [[ ${#tables[@]} -gt 0 ]] || fatal "无法检查监听端口，请先安装 iproute2。"
+        awk -v suffix=":${hex}" '$2 ~ suffix "$" && $4 == "0A" { found=1 } END { exit !found }' "${tables[@]}"
+    fi
 }
 
 random_free_port() {
@@ -253,7 +483,7 @@ random_free_port() {
     local attempt port range
     range=$((end - start + 1))
     for ((attempt = 1; attempt <= 200; attempt++)); do
-        port=$((start + (16#$(openssl rand -hex 2) % range)))
+        port=$((start + ((RANDOM * 32768 + RANDOM) % range)))
         if ! port_in_use "$port"; then
             printf '%s' "$port"
             return 0
@@ -292,13 +522,21 @@ build_vless_subscription_url() {
 
 detect_public_ip() {
     local ip
-    ip="$(curl -4fsS --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    if command_exists curl; then
+        ip="$(curl -4fsS --connect-timeout 5 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    else
+        ip="$(wget -4 -qO- -T 8 -t 1 https://api.ipify.org 2>/dev/null || true)"
+    fi
     ip="$(trim "$ip")"
     if validate_ipv4 "$ip"; then
         printf '%s' "$ip"
         return 0
     fi
-    ip="$(curl -6fsS --connect-timeout 5 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
+    if command_exists curl; then
+        ip="$(curl -6fsS --connect-timeout 5 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
+    else
+        ip="$(wget -6 -qO- -T 8 -t 1 https://api6.ipify.org 2>/dev/null || true)"
+    fi
     ip="$(trim "$ip")"
     if validate_ipv6 "$ip"; then
         printf '%s' "$ip"
@@ -476,7 +714,7 @@ write_state() {
     mkdir -p -- "$APP_DIR"
     chmod 700 "$APP_DIR"
     node_b64="$(printf '%s' "$NODE_NAME" | base64 -w 0)"
-    temp="$(mktemp "${APP_DIR}/.state.XXXXXX")"
+    temp="$(artifact_temp "$APP_DIR" state)"
     umask 077
     {
         printf 'STATE_VERSION=%s\n' "$STATE_VERSION"
@@ -505,15 +743,42 @@ write_state() {
 }
 
 check_unmanaged_conflicts() {
-    if [[ -e "$SINGBOX_CONFIG" || -e "$STATE_FILE" ]]; then
+    local existing_config overrides fragment unit
+    if [[ -e "$SINGBOX_CONFIG" || -L "$SINGBOX_CONFIG" || -e "$STATE_FILE" || -L "$STATE_FILE" ]]; then
         fatal "发现现有 sing-box 或 singbox-agent 配置，拒绝接管。"
     fi
-    if dpkg-query -W -f='${Status}' sing-box 2>/dev/null | grep -q 'install ok installed'; then
-        fatal "系统已安装 sing-box，拒绝接管。"
+    [[ ! -L "$SINGBOX_DIR" ]] || fatal "sing-box 配置目录为链接，拒绝接管。"
+    if [[ -d "$SINGBOX_DIR" ]]; then
+        existing_config="$(find "$SINGBOX_DIR" \( -type f -o -type l \) -print -quit)"
+        [[ -z "$existing_config" ]] || fatal "发现现有 sing-box 配置：${existing_config}，拒绝接管。"
     fi
-    if [[ -e "$NGINX_SITE_AVAILABLE" || -L "$NGINX_SITE_ENABLED" ]]; then
+    if [[ -e "$NGINX_SITE_AVAILABLE" || -L "$NGINX_SITE_AVAILABLE" || -e "$NGINX_SITE_ENABLED" || -L "$NGINX_SITE_ENABLED" ]]; then
         fatal "发现同名 nginx 配置，拒绝覆盖。"
     fi
+    if systemctl is-active --quiet sing-box.service; then
+        fatal "sing-box 服务正在运行，拒绝接管。"
+    fi
+    # 尚未 daemon-reload 的本地服务覆盖也必须识别。
+    for unit in "${ROOT_PREFIX}/etc/systemd/system/sing-box.service" \
+        "${ROOT_PREFIX}/etc/systemd/system/sing-box.service.d" \
+        "${ROOT_PREFIX}/run/systemd/system/sing-box.service" \
+        "${ROOT_PREFIX}/run/systemd/system/sing-box.service.d"; do
+        [[ ! -e "$unit" && ! -L "$unit" ]] || fatal "发现自定义 sing-box 服务配置：${unit}，拒绝接管。"
+    done
+    overrides="$(systemctl show sing-box.service -p DropInPaths --value 2>/dev/null || true)"
+    fragment="$(systemctl show sing-box.service -p FragmentPath --value 2>/dev/null || true)"
+    [[ -z "$overrides" && ( -z "$fragment" || "$fragment" == /usr/lib/systemd/system/sing-box.service || "$fragment" == /lib/systemd/system/sing-box.service ) ]] || \
+        fatal "发现自定义 sing-box 服务或覆盖配置，拒绝接管。"
+    SINGBOX_INSTALLED_BY_SCRIPT=0
+    if singbox_package_installed; then
+        info "发现未配置且未运行的 sing-box，将复用软件包；回滚和卸载保留该软件包。"
+    elif command_exists sing-box; then
+        fatal "发现非 APT 安装的 sing-box，拒绝接管。"
+    fi
+}
+
+singbox_package_installed() {
+    [[ "$(dpkg-query -W -f='${Status}' sing-box 2>/dev/null)" == 'install ok installed' ]]
 }
 
 install_base_dependencies() {
@@ -552,21 +817,28 @@ Components: *
 Enabled: yes
 Signed-By: ${APT_KEY_FILE}
 EOF
-    install -m 644 "$key_temp" "$APT_KEY_FILE"
     TX_APT_KEY_CREATED=1
-    install -m 644 "$source_temp" "$APT_SOURCE_FILE"
+    write_transaction
+    install -m 644 "$key_temp" "$APT_KEY_FILE"
     TX_APT_SOURCE_CREATED=1
+    write_transaction
+    install -m 644 "$source_temp" "$APT_SOURCE_FILE"
     rm -f -- "$key_temp" "$source_temp"
     APT_KEY_CREATED=1
     APT_SOURCE_CREATED=1
 }
 
 install_singbox_package() {
-    info "安装 sing-box 稳定版。"
-    apt-get update
-    TX_SINGBOX_INSTALLED=1
-    DEBIAN_FRONTEND=noninteractive apt-get install -y sing-box
-    SINGBOX_INSTALLED_BY_SCRIPT=1
+    if ! singbox_package_installed; then
+        info "安装 sing-box 稳定版。"
+        apt-get update
+        TX_SINGBOX_INSTALLED=1
+        write_transaction
+        DEBIAN_FRONTEND=noninteractive apt-get install -y sing-box
+        SINGBOX_INSTALLED_BY_SCRIPT=1
+    else
+        SINGBOX_INSTALLED_BY_SCRIPT=0
+    fi
     command_exists sing-box || fatal "sing-box 安装后不可执行。"
     systemctl cat sing-box.service >/dev/null 2>&1 || fatal "官方 sing-box.service 不存在。"
 }
@@ -637,7 +909,7 @@ get_service_group() {
 install_singbox_config() {
     local temp service_group
     mkdir -p -- "$SINGBOX_DIR"
-    temp="$(mktemp "${SINGBOX_DIR}/.config.json.XXXXXX")"
+    temp="$(artifact_temp "$SINGBOX_DIR" config)"
     render_singbox_config "$temp"
     sing-box check -c "$temp"
     service_group="$(get_service_group)"
@@ -734,19 +1006,19 @@ write_client_artifacts() {
     mkdir -p -- "$APP_DIR" "$WEB_DIR"
     chmod 700 "$APP_DIR"
     chmod 711 "$(dirname "$WEB_DIR")" "$WEB_DIR"
-    uri_temp="$(mktemp "${APP_DIR}/.uri.XXXXXX")"
+    uri_temp="$(artifact_temp "$APP_DIR" uri)"
     printf '%s\n' "$uri" >"$uri_temp"
     chmod 600 "$uri_temp"
     mv -f -- "$uri_temp" "$URI_FILE"
-    qr_temp="$(mktemp "${APP_DIR}/.qr.XXXXXX")"
+    qr_temp="$(artifact_temp "$APP_DIR" qr)"
     qrencode -o "$qr_temp" -s 4 -m 1 "$uri"
     chmod 600 "$qr_temp"
     mv -f -- "$qr_temp" "$QR_FILE"
-    clash_temp="$(mktemp "${WEB_DIR}/.clash.XXXXXX")"
+    clash_temp="$(artifact_temp "$WEB_DIR" clash)"
     render_mihomo_subscription "$clash_temp"
     chmod 644 "$clash_temp"
     mv -f -- "$clash_temp" "$WEB_CLASH_SUBSCRIPTION"
-    vless_temp="$(mktemp "${WEB_DIR}/.vless.XXXXXX")"
+    vless_temp="$(artifact_temp "$WEB_DIR" vless)"
     printf '%s\n' "$uri" | base64 -w 0 >"$vless_temp"
     printf '\n' >>"$vless_temp"
     chmod 644 "$vless_temp"
@@ -756,7 +1028,7 @@ write_client_artifacts() {
 install_nginx_config() {
     local temp nginx_dump
     mkdir -p -- "$(dirname "$NGINX_SITE_AVAILABLE")" "$(dirname "$NGINX_SITE_ENABLED")"
-    temp="$(mktemp "$(dirname "$NGINX_SITE_AVAILABLE")/.singbox-agent.XXXXXX")"
+    temp="$(artifact_temp "$(dirname "$NGINX_SITE_AVAILABLE")" nginx)"
     render_nginx_config "$temp"
     chmod 644 "$temp"
     mv -f -- "$temp" "$NGINX_SITE_AVAILABLE"
@@ -783,11 +1055,24 @@ add_ufw_rule() {
         printf -v "$flag_name" '%s' "0"
         return
     fi
+    # 先持久化新增规则意图，避免信号恰好到达 ufw 返回与赋值之间。
+    if [[ "$flag_name" == UFW_REALITY_RULE_CREATED ]]; then
+        TX_UFW_REALITY_ADDED=1
+    else
+        TX_UFW_SUBSCRIPTION_ADDED=1
+    fi
+    write_transaction
     if ufw allow "${port}/tcp" comment 'singbox-agent' >/dev/null; then
         printf -v "$flag_name" '%s' "1"
     else
         warn "UFW 规则添加失败：${port}/tcp。"
         printf -v "$flag_name" '%s' "0"
+        if [[ "$flag_name" == UFW_REALITY_RULE_CREATED ]]; then
+            TX_UFW_REALITY_ADDED=0
+        else
+            TX_UFW_SUBSCRIPTION_ADDED=0
+        fi
+        write_transaction
     fi
 }
 
@@ -823,28 +1108,47 @@ start_services() {
 }
 
 begin_transaction() {
-    TX_DIR="$(mktemp -d /tmp/singbox-agent.XXXXXX)"
+    local path index=0 staging="${TRANSACTION_DIR}.prepare"
+    local -a names
+    [[ ! -e "$TRANSACTION_DIR" && ! -L "$TRANSACTION_DIR" ]] || fatal "存在待恢复的安装事务。"
+    [[ ! -L "$staging" ]] || fatal "事务准备目录异常。"
+    # prepare 阶段尚未修改系统资源；上次准备失败的备份可安全重建。
+    rm -rf -- "$staging"
+    mkdir -p -- "$(dirname "$TRANSACTION_DIR")"
+    mkdir -- "$staging"
+    chmod 700 "$staging"
+    TX_DIR="$staging"
+    TX_PHASE=pending
+    TX_SINGBOX_INSTALLED=0
+    TX_APT_KEY_CREATED=0
+    TX_APT_SOURCE_CREATED=0
+    TX_UFW_REALITY_ADDED=0
+    TX_UFW_SUBSCRIPTION_ADDED=0
+    TX_SINGBOX_WAS_ACTIVE=0
+    TX_NGINX_WAS_ACTIVE=0
+    TX_SINGBOX_WAS_ENABLED=0
+    TX_NGINX_WAS_ENABLED=0
+    umask 077
     systemctl is-active --quiet sing-box.service 2>/dev/null && TX_SINGBOX_WAS_ACTIVE=1
     systemctl is-active --quiet nginx.service 2>/dev/null && TX_NGINX_WAS_ACTIVE=1
-    backup_path "$SINGBOX_CONFIG" "singbox-config"
-    backup_path "$NGINX_SITE_AVAILABLE" "nginx-site"
-    backup_path "$NGINX_SITE_ENABLED" "nginx-link"
-    backup_path "$WEB_CLASH_SUBSCRIPTION" "clash-subscription"
-    backup_path "$WEB_VLESS_SUBSCRIPTION" "vless-subscription"
-    backup_path "$LEGACY_WEB_SUBSCRIPTION" "legacy-subscription"
-    backup_path "$URI_FILE" "uri"
-    backup_path "$QR_FILE" "qr"
-    backup_path "$STATE_FILE" "state"
-    backup_path "$MANAGER_FILE" "manager"
-    backup_path "$COMMAND_LINK" "command-link"
+    systemctl is-enabled --quiet sing-box.service 2>/dev/null && TX_SINGBOX_WAS_ENABLED=1
+    systemctl is-enabled --quiet nginx.service 2>/dev/null && TX_NGINX_WAS_ENABLED=1
+    mapfile -t names < <(transaction_names)
+    while IFS= read -r path; do
+        backup_path "$path" "${names[$index]}"
+        index=$((index + 1))
+    done < <(transaction_paths)
+    write_transaction
+    mv -- "$staging" "$TRANSACTION_DIR"
+    TX_DIR="$TRANSACTION_DIR"
     ROLLBACK_ACTIVE=1
-    trap 'handle_error $? $LINENO' ERR
-    trap 'handle_error 130 $LINENO' INT TERM
+    install_traps
 }
 
 finish_transaction() {
+    TX_PHASE=committed
+    write_transaction
     ROLLBACK_ACTIVE=0
-    trap - ERR INT TERM
     cleanup_transaction
 }
 
@@ -886,12 +1190,14 @@ configure_installation() {
     done
     prompt_reality_target "$default_host" "$default_host_port"
 
-    if [[ "$managed" != "1" ]]; then
-        generate_credentials
-    fi
-
     if [[ "$ROLLBACK_ACTIVE" != "1" ]]; then
         begin_transaction
+    fi
+    if [[ "$managed" != "1" ]]; then
+        install_base_dependencies
+        setup_official_repository
+        install_singbox_package
+        generate_credentials
     fi
     install_singbox_config
     write_client_artifacts
@@ -905,15 +1211,14 @@ configure_installation() {
     add_ufw_rule "$SUBSCRIPTION_PORT" UFW_SUBSCRIPTION_RULE_CREATED
     TX_UFW_REALITY_ADDED="$UFW_REALITY_RULE_CREATED"
     TX_UFW_SUBSCRIPTION_ADDED="$UFW_SUBSCRIPTION_RULE_CREATED"
+    write_transaction
 
     if [[ "$managed" == "1" ]]; then
         if [[ "$old_reality_port" == "$REALITY_PORT" && "$old_ufw_reality" == "1" ]]; then
             UFW_REALITY_RULE_CREATED=1
-            TX_UFW_REALITY_ADDED=0
         fi
         if [[ "$old_subscription_port" == "$SUBSCRIPTION_PORT" && "$old_ufw_subscription" == "1" ]]; then
             UFW_SUBSCRIPTION_RULE_CREATED=1
-            TX_UFW_SUBSCRIPTION_ADDED=0
         fi
     fi
 
@@ -933,17 +1238,21 @@ install_command() {
     require_root
     check_supported_system
     [[ -t 0 ]] || fatal "安装需要交互式终端。"
+    acquire_install_lock
+    install_traps
+    recover_transaction
+    command_exists openssl || fatal "未找到 openssl，请先安装 openssl 后重试。"
     if [[ -f "$STATE_FILE" ]]; then
         info "检测到本项目安装，进入重新配置。现有 UUID、密钥和订阅令牌保持不变。"
         configure_installation 1
+        trap - ERR INT TERM HUP EXIT
+        release_install_lock
         return
     fi
     check_unmanaged_conflicts
-    begin_transaction
-    install_base_dependencies
-    setup_official_repository
-    install_singbox_package
     configure_installation 0
+    trap - ERR INT TERM HUP EXIT
+    release_install_lock
 }
 
 show_configuration() {

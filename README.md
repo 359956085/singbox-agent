@@ -25,6 +25,12 @@ apt-get update && apt-get install -y wget ca-certificates && wget -O /tmp/singbo
 
 端口留空时随机选择。Reality 目标留空时，从内置候选中选择通过 DNS、TLS 1.3 和证书校验的站点。
 
+节点参数在安装依赖和 sing-box 软件包之前询问。按 Ctrl+C 取消后，可再次执行同一条一键安装命令。脚本会先恢复未完成安装，再开始新的安装；SSH 断开或进程强制终止后也会在下次安装时检查恢复记录。
+
+如果旧版中断后只留下已安装的 sing-box 软件包，新版会在配置目录没有配置文件或链接、服务未运行、没有自定义服务覆盖及同名 nginx 配置时自动复用它。复用的软件包在回滚和后续卸载时保留；已有业务配置仍会拒绝接管。
+
+回滚失败时会显示具体失败项，并保留 `/var/lib/singbox-agent/transaction` 中的恢复记录和备份。卸载 sing-box 失败时同时保留 APT 源和密钥。处理提示中的问题（例如 APT 锁或软件包错误）后，重新执行安装即可重试恢复；不要手工删除恢复目录。并发安装会被拒绝。
+
 ## 管理
 
 ```bash
@@ -59,7 +65,7 @@ sba
 - Reality 私钥、VLESS 链接和二维码仅保存在 root 可读目录。
 - 在线订阅使用随机 32 字节路径令牌，nginx 不记录该虚拟主机访问日志。
 - 无域名订阅只能使用 HTTP。链路观察者可能看到订阅 URL。请把完整 URL 当作密码保存。
-- 脚本不会覆盖已有 sing-box 安装或同名 nginx 配置。
+- 脚本不会接管已有 sing-box 业务配置、运行中的服务或自定义服务覆盖，也不会覆盖同名 nginx 配置；仅复用通过检查的未配置软件包。
 - 不会调用第三方二维码服务。
 
 ## 主要文件
@@ -78,12 +84,14 @@ sba
 ## 本地检查
 
 ```bash
-bash -n install.sh tests/test.sh .github/scripts/sync-cnb.sh
+bash -n install.sh tests/test.sh tests/recovery.sh
 bash tests/test.sh
-shellcheck -x install.sh tests/test.sh .github/scripts/sync-cnb.sh
+shellcheck -x install.sh tests/test.sh tests/recovery.sh
 ```
 
 集成验收需在全新 Debian 或 Ubuntu 虚拟机执行。不要在已有 sing-box 业务的机器上测试安装流程。
+
+恢复测试使用临时根目录及系统命令替身；Linux 下额外使用 Python 3 伪终端发送真实 Ctrl+C，并验证安装中断后重试、其他信号和安装锁。该测试不安装软件包或修改真实服务。
 
 ## 许可证
 

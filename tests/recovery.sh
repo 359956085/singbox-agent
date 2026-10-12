@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+
+# 安装恢复回归测试：所有系统命令均使用替身，不访问真实服务、APT 或网络。
+set -Eeuo pipefail
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_SANDBOX="$(mktemp -d)"
+trap 'rm -rf -- "$TEST_SANDBOX"' EXIT
+passed=0
+
+check() {
+    local description="$1"
+    shift
+    if "$@"; then
+        printf '通过：%s\n' "$description"
+        passed=$((passed + 1))
+    else
+        printf '失败：%s\n' "$description" >&2
+        exit 1
+    fi
+}
+
+harness="${TEST_SANDBOX}/harness.sh"
+cat >"$harness" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source "${PROJECT_DIR:?}/install.sh"
+action="$1"
+mkdir -p "$SBA_ROOT/mock"
+REALITY_PORT=23456
+SUBSCRIPTION_PORT=45678
+NODE_NAME=original-node
+PUBLIC_IP=203.0.113.10
+LISTEN_ADDRESS=0.0.0.0
+REALITY_HOST=addons.mozilla.org
+REALITY_DEST_PORT=443
+UUID=11111111-2222-3333-4444-555555555555
+PRIVATE_KEY=abcdefghijklmnopqrstuvwxyzABCDE_1234567890-xyz
+PUBLIC_KEY=abcdefghijklmnopqrstuvwxyzABCDE_1234567890-xyz
+SHORT_ID=0123456789abcdef
+SUBSCRIPTION_TOKEN="$(printf 'ab%.0s' {1..32})"
+SINGBOX_INSTALLED_BY_SCRIPT=0
+APT_KEY_CREATED=0
+APT_SOURCE_CREATED=0
+UFW_REALITY_RULE_CREATED=0
+UFW_SUBSCRIPTION_RULE_CREATED=0
+INSTALLED_VERSION=1.0.0
+
+require_root() { :; }
+check_supported_system() { :; }
+command_exists() {
+    if [[ "$1" == sing-box ]]; then
+        [[ -f "$SBA_ROOT/mock/package" ]]
+    else
+        command -v "$1" >/dev/null 2>&1
+    fi
+}
+systemctl() {
+    case "$1" in
+        is-active) [[ -f "$SBA_ROOT/mock/${!#}.active" ]] ;;
+        is-enabled) [[ -f "$SBA_ROOT/mock/${!#}.enabled" ]] ;;
+        cat) [[ "$2" == nginx.service || -f "$SBA_ROOT/mock/package" ]] ;;
+        show)
+            if [[ "$4" == DropInPaths && -f "$SBA_ROOT/mock/custom" ]]; then
+                printf '/etc/systemd/system/sing-box.service.d/custom.conf\n'
+            elif [[ "$4" == FragmentPath && -f "$SBA_ROOT/mock/unit" ]]; then
+                printf '/etc/systemd/system/sing-box.service\n'
+            fi ;;
+        enable) touch "$SBA_ROOT/mock/$2.enabled" ;;
+        disable) rm -f "$SBA_ROOT/mock/$2.enabled" ;;
+        stop) rm -f "$SBA_ROOT/mock/$2.active" ;;
+        restart|start|reload) touch "$SBA_ROOT/mock/$2.active" ;;
+        *) return 1 ;;
+    esac
+}
+dpkg-query() {
+    [[ -f "$SBA_ROOT/mock/package" ]] || return 1
+    printf 'install ok installed'
+}
+apt-get() {
+    local IFS=' '
+    printf '%s\n' "$*" >>"$SBA_ROOT/mock/apt.log"
+    case "$*" in
+        *'purge -y sing-box')
+            [[ ! -f "$SBA_ROOT/mock/fail-purge" ]] || return 42
+            rm -f "$SBA_ROOT/mock/package" ;;
+        'install -y sing-box')
+            touch "$SBA_ROOT/mock/package"
+            if [[ "${WAIT_PACKAGE:-0}" == 1 ]]; then
+                printf 'PACKAGE_READY\n'
+                sleep 30
+            fi ;;
+        *) : ;;
+    esac
+}
+sing-box() {
+    case "$1" in
+        version) printf 'sing-box version 1.0.0\n' ;;
+        *) return 1 ;;
+    esac
+}
+nginx() { :; }
+curl() {
+    # setup_official_repository 唯一的 curl 调用；用假密钥取代网络。
+    printf 'test-key\n' >"${!#}"
+}
+gpg() { :; }
+ufw() {
+    local IFS=' '
+    case "$*" in
+        status)
+            printf 'Status: active\n'
+            if [[ -f "$SBA_ROOT/mock/ufw" ]]; then cat "$SBA_ROOT/mock/ufw"; fi ;;
+        allow*) printf '%s\n' "$2" >>"$SBA_ROOT/mock/ufw" ;;
+        '--force delete allow '*)
+            [[ ! -f "$SBA_ROOT/mock/fail-ufw" ]] || return 1
+            grep -Fvx "$4" "$SBA_ROOT/mock/ufw" >"$SBA_ROOT/mock/ufw.next" || true
+            mv "$SBA_ROOT/mock/ufw.next" "$SBA_ROOT/mock/ufw" ;;
+        *) return 1 ;;
+    esac
+}
+# Git Bash 没有 flock；只用于串行隔离测试，锁竞争在 Linux 伪终端测试中验证。
+if ! command -v flock >/dev/null 2>&1; then flock() { :; }; fi
+install_base_dependencies() { touch "$SBA_ROOT/mock/dependencies"; }
+generate_credentials() { touch "$SBA_ROOT/mock/generated"; }
+if [[ "$action" != prompt ]]; then
+    prompt_node_name() { NODE_NAME="${1:-original-node}"; }
+fi
+prompt_public_ip() { :; }
+prompt_port() {
+    if [[ "$1" == REALITY_PORT ]]; then REALITY_PORT=23456; else SUBSCRIPTION_PORT=45678; fi
+}
+prompt_reality_target() { :; }
+if [[ "$action" == render-fail ]]; then
+    render_singbox_config() { printf 'partial-config\n' >"$1"; return 63; }
+else
+    install_singbox_config() {
+        mkdir -p "$SINGBOX_DIR"
+        printf '%s\n' "$UUID" >"$SINGBOX_CONFIG"
+    }
+fi
+write_client_artifacts() {
+    mkdir -p "$APP_DIR" "$WEB_DIR"
+    printf '%s\n' "$UUID" >"$URI_FILE"
+    touch "$QR_FILE" "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION"
+}
+install_nginx_config() {
+    mkdir -p "$(dirname "$NGINX_SITE_AVAILABLE")" "$(dirname "$NGINX_SITE_ENABLED")"
+    touch "$NGINX_SITE_AVAILABLE"
+    ln -s "$NGINX_SITE_AVAILABLE" "$NGINX_SITE_ENABLED"
+}
+start_services() {
+    [[ ! -f "$SBA_ROOT/mock/fail-start" ]] || return 51
+    systemctl enable sing-box.service
+    systemctl restart sing-box.service
+    systemctl enable nginx.service
+    systemctl start nginx.service
+}
+show_configuration() { :; }
+
+case "$action" in
+    legacy|legacy-rollback)
+        touch "$SBA_ROOT/mock/package"
+        check_unmanaged_conflicts
+        begin_transaction
+        install_singbox_package
+        [[ "$SINGBOX_INSTALLED_BY_SCRIPT" == 0 && "$TX_SINGBOX_INSTALLED" == 0 ]]
+        if [[ "$action" == legacy-rollback ]]; then
+            rollback_transaction
+        else
+            configure_installation 0
+            uninstall_command <<<'y'
+        fi
+        [[ -f "$SBA_ROOT/mock/package" ]] ;;
+    conflict-*)
+        touch "$SBA_ROOT/mock/package"
+        case "$action" in
+            conflict-config) mkdir -p "$SINGBOX_DIR"; touch "$SINGBOX_CONFIG" ;;
+            conflict-extra) mkdir -p "$SINGBOX_DIR/conf.d"; touch "$SINGBOX_DIR/conf.d/node.json" ;;
+            conflict-link) mkdir -p "$SINGBOX_DIR"; ln -s /nonexistent "$SINGBOX_DIR/other.json" ;;
+            conflict-active) touch "$SBA_ROOT/mock/sing-box.service.active" ;;
+            conflict-dropin) touch "$SBA_ROOT/mock/custom" ;;
+            conflict-unit) touch "$SBA_ROOT/mock/unit" ;;
+            conflict-unloaded) mkdir -p "$SBA_ROOT/etc/systemd/system/sing-box.service.d"; touch "$SBA_ROOT/etc/systemd/system/sing-box.service.d/custom.conf" ;;
+            conflict-nginx) mkdir -p "$(dirname "$NGINX_SITE_AVAILABLE")"; touch "$NGINX_SITE_AVAILABLE" ;;
+        esac
+        check_unmanaged_conflicts ;;
+    rollback-fail)
+        begin_transaction
+        TX_SINGBOX_INSTALLED=1
+        TX_APT_KEY_CREATED=1
+        TX_APT_SOURCE_CREATED=1
+        write_transaction
+        mkdir -p "$SINGBOX_DIR" "$(dirname "$APT_KEY_FILE")" "$(dirname "$APT_SOURCE_FILE")"
+        touch "$SBA_ROOT/mock/package" "$SBA_ROOT/mock/fail-purge" "$APT_KEY_FILE" "$APT_SOURCE_FILE" "$SINGBOX_CONFIG"
+        handle_error 130 "$LINENO" ;;
+    recover)
+        rm -f "$SBA_ROOT/mock/fail-purge" "$SBA_ROOT/mock/fail-start"
+        acquire_install_lock
+        install_traps
+        recover_transaction
+        [[ ! -e "$TRANSACTION_DIR" ]]
+        check_unmanaged_conflicts
+        configure_installation 0
+        [[ -e "$STATE_FILE" && -e "$COMMAND_LINK" ]]
+        [[ "$(state_get SINGBOX_INSTALLED_BY_SCRIPT)" == 1 ]] ;;
+    reconfigure|reconfigure-fail|reconfigure-ufw-fail)
+        touch "$SBA_ROOT/mock/package" "$SBA_ROOT/mock/sing-box.service.active" "$SBA_ROOT/mock/sing-box.service.enabled"
+        mkdir -p "$SINGBOX_DIR"
+        printf 'original-config\n' >"$SINGBOX_CONFIG"
+        if [[ "$action" == reconfigure-ufw-fail ]]; then
+            UFW_REALITY_RULE_CREATED=1
+            UFW_SUBSCRIPTION_RULE_CREATED=1
+            install_manager() { return 57; }
+        fi
+        write_state
+        cp "$STATE_FILE" "$SBA_ROOT/mock/original-state"
+        if [[ "$action" == reconfigure-fail ]]; then touch "$SBA_ROOT/mock/fail-start"; fi
+        configure_installation 1
+        [[ ! -e "$SBA_ROOT/mock/generated" ]]
+        [[ "$(state_get UUID)" == "$UUID" && "$(state_get PRIVATE_KEY)" == "$PRIVATE_KEY" && "$(state_get SUBSCRIPTION_TOKEN)" == "$SUBSCRIPTION_TOKEN" ]] ;;
+    exit-uncommitted) begin_transaction; exit 0 ;;
+    kill-uncommitted) begin_transaction; printf 'TRANSACTION_READY\n'; sleep 30 ;;
+    commit|commit-signal|commit-cleanup-interrupted)
+        begin_transaction
+        mkdir -p "$APP_DIR" "$(dirname "$COMMAND_LINK")"
+        touch "$STATE_FILE" "$COMMAND_LINK"
+        TX_PHASE=committed
+        write_transaction
+        if [[ "$action" == commit-signal ]]; then handle_error 130 "$LINENO"; fi
+        if [[ "$action" == commit-cleanup-interrupted ]]; then mv "$TX_DIR" "${TRANSACTION_DIR}.cleanup"; fi
+        # 模拟写提交标记后、清理前进程消失。
+        ROLLBACK_ACTIVE=0 ;;
+    cleanup-committed) recover_transaction; [[ -e "$STATE_FILE" && -e "$COMMAND_LINK" ]] ;;
+    invalid-record)
+        begin_transaction
+        ROLLBACK_ACTIVE=0
+        printf 'TX_SINGBOX_INSTALLED=$(touch %s/mock/injected)\n' "$SBA_ROOT" >>"$TX_DIR/record.conf"
+        recover_transaction ;;
+    rollback-file-fail)
+        begin_transaction
+        mkdir -p "$SINGBOX_CONFIG"
+        rollback_transaction ;;
+    recover-file)
+        rmdir "$SINGBOX_CONFIG"
+        recover_transaction
+        [[ ! -e "$TRANSACTION_DIR" ]] ;;
+    ufw-recover)
+        begin_transaction
+        add_ufw_rule "$REALITY_PORT" UFW_REALITY_RULE_CREATED
+        [[ "$TX_UFW_REALITY_ADDED" == 1 ]]
+        touch "$SBA_ROOT/mock/fail-ufw"
+        if rollback_transaction; then exit 1; fi
+        [[ -e "$TRANSACTION_DIR/record.conf" ]]
+        rm "$SBA_ROOT/mock/fail-ufw"
+        recover_transaction
+        [[ ! -s "$SBA_ROOT/mock/ufw" ]] ;;
+    render-fail)
+        touch "$SBA_ROOT/mock/package"
+        begin_transaction
+        install_singbox_config ;;
+    render-retry) check_unmanaged_conflicts ;;
+    subshell-fail)
+        mkdir -p "$SINGBOX_DIR"
+        printf 'original-config\n' >"$SINGBOX_CONFIG"
+        begin_transaction
+        result="$(false)" ;;
+    lock-wait) acquire_install_lock; printf 'LOCK_READY\n'; sleep 30 ;;
+    lock-once) acquire_install_lock ;;
+    prompt|install)
+        if [[ "${FAIL_PURGE:-0}" == 1 ]]; then
+            touch "$SBA_ROOT/mock/fail-purge"
+        else
+            rm -f "$SBA_ROOT/mock/fail-purge"
+        fi
+        install_command ;;
+    *) exit 99 ;;
+esac
+SH
+
+run_case() {
+    local root="$1" action="$2" expected="$3" code=0
+    PROJECT_DIR="$PROJECT_DIR" SBA_ROOT="$root" bash "$harness" "$action" >"${TEST_SANDBOX}/output" 2>&1 || code=$?
+    if [[ "$code" != "$expected" ]]; then cat "${TEST_SANDBOX}/output"; fi
+    check "$action 退出码为 $expected" test "$code" -eq "$expected"
+}
+
+run_case "$TEST_SANDBOX/legacy" legacy 0
+check '复用的软件包在卸载后仍存在' test -f "$TEST_SANDBOX/legacy/mock/package"
+run_case "$TEST_SANDBOX/legacy-rollback" legacy-rollback 0
+for scenario in config extra link active dropin unit unloaded nginx; do
+    run_case "$TEST_SANDBOX/conflict-$scenario" "conflict-$scenario" 1
+    check "冲突 $scenario 不修改 APT" test ! -e "$TEST_SANDBOX/conflict-$scenario/mock/apt.log"
+done
+
+failure_root="$TEST_SANDBOX/failure"
+run_case "$failure_root" rollback-fail 130
+check '卸载失败保留恢复记录' test -f "$failure_root/var/lib/singbox-agent/transaction/record.conf"
+check '卸载失败保留 APT 源' test -f "$failure_root/etc/apt/sources.list.d/sagernet.sources"
+check '卸载失败保留 APT 密钥' test -f "$failure_root/etc/apt/keyrings/sagernet.asc"
+if [[ "$(uname -s)" == Linux ]]; then
+    check '恢复目录权限为 700' test "$(stat -c '%a' "$failure_root/var/lib/singbox-agent/transaction")" = 700
+    check '恢复记录权限为 600' test "$(stat -c '%a' "$failure_root/var/lib/singbox-agent/transaction/record.conf")" = 600
+fi
+run_case "$failure_root" recover 0
+check '恢复再安装后清理事务' test ! -e "$failure_root/var/lib/singbox-agent/transaction"
+run_case "$TEST_SANDBOX/reconfigure" reconfigure 0
+run_case "$TEST_SANDBOX/reconfigure-fail" reconfigure-fail 51
+check '重新配置失败恢复旧配置' grep -Fxq original-config "$TEST_SANDBOX/reconfigure-fail/etc/sing-box/config.json"
+check '重新配置失败恢复旧状态和凭据' cmp "$TEST_SANDBOX/reconfigure-fail/etc/singbox-agent/state.conf" "$TEST_SANDBOX/reconfigure-fail/mock/original-state"
+check '重新配置失败保留原服务运行状态' test -f "$TEST_SANDBOX/reconfigure-fail/mock/sing-box.service.active"
+run_case "$TEST_SANDBOX/exit" exit-uncommitted 1
+check '正常退出但未提交也执行回滚' test ! -e "$TEST_SANDBOX/exit/var/lib/singbox-agent/transaction"
+run_case "$TEST_SANDBOX/commit" commit 0
+run_case "$TEST_SANDBOX/commit" cleanup-committed 0
+check '提交后恢复只清理备份' test ! -e "$TEST_SANDBOX/commit/var/lib/singbox-agent/transaction"
+run_case "$TEST_SANDBOX/commit-signal" commit-signal 130
+check '提交标记落盘后收到信号保留安装状态' test -e "$TEST_SANDBOX/commit-signal/etc/singbox-agent/state.conf"
+run_case "$TEST_SANDBOX/commit-cleanup" commit-cleanup-interrupted 0
+run_case "$TEST_SANDBOX/commit-cleanup" cleanup-committed 0
+check '清理备份中断后可再次清理' test ! -e "$TEST_SANDBOX/commit-cleanup/var/lib/singbox-agent/transaction.cleanup"
+run_case "$TEST_SANDBOX/invalid" invalid-record 1
+check '恢复记录不会执行命令' test ! -e "$TEST_SANDBOX/invalid/mock/injected"
+check '无效记录保留现场' test -f "$TEST_SANDBOX/invalid/var/lib/singbox-agent/transaction/record.conf"
+run_case "$TEST_SANDBOX/file" rollback-file-fail 1
+check '文件恢复失败保留备份' test -d "$TEST_SANDBOX/file/var/lib/singbox-agent/transaction"
+run_case "$TEST_SANDBOX/file" recover-file 0
+run_case "$TEST_SANDBOX/ufw" ufw-recover 0
+run_case "$TEST_SANDBOX/reconfigure-ufw" reconfigure-ufw-fail 57
+check '重新配置失败移除本次补建的旧端口 UFW 规则' test ! -s "$TEST_SANDBOX/reconfigure-ufw/mock/ufw"
+run_case "$TEST_SANDBOX/render" render-fail 63
+check '配置渲染失败清理同目录暂存文件' test ! -e "$TEST_SANDBOX/render/etc/sing-box/.singbox-agent-config.tmp"
+run_case "$TEST_SANDBOX/render" render-retry 0
+run_case "$TEST_SANDBOX/subshell" subshell-fail 1
+check '命令替换失败只回滚一次并保留旧配置' grep -Fxq original-config "$TEST_SANDBOX/subshell/etc/sing-box/config.json"
+
+if [[ "$(uname -s)" == Linux ]]; then
+    # forkpty 建立控制终端，通过终端的 VINTR 字符发送真实 Ctrl+C。
+    check 'Linux 伪终端中断、重试与锁竞争' python3 - "$harness" "$PROJECT_DIR" "$TEST_SANDBOX" <<'PY'
+import errno
+import os
+import pathlib
+import pty
+import select
+import signal
+import subprocess
+import sys
+import time
+
+harness, project, sandbox = sys.argv[1:]
+
+def launch(root, action, marker=None, sig=signal.SIGINT, **extra):
+    env = dict(os.environ, PROJECT_DIR=project, SBA_ROOT=str(root), **extra)
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.execvpe("bash", ["bash", harness, action], env)
+    output = b""
+    sent = marker is None
+    status = None
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    output += os.read(fd, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+            if not sent and marker in output:
+                if sig == signal.SIGINT:
+                    os.write(fd, b"\x03")
+                else:
+                    os.killpg(pid, sig)
+                sent = True
+            waited, status_now = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                status = status_now
+                break
+        assert status is not None, output.decode(errors="replace")
+        assert sent, output.decode(errors="replace")
+        return os.waitstatus_to_exitcode(status), output
+    finally:
+        if status is None:
+            os.killpg(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        os.close(fd)
+
+root = pathlib.Path(sandbox) / "pty-prompt"
+code, out = launch(root, "prompt", "节点名称".encode())
+assert code == 130, (code, out)
+assert not (root / "mock/dependencies").exists()
+assert not (root / "var/lib/singbox-agent/transaction").exists()
+assert launch(root, "install")[0] == 0
+assert (root / "usr/local/bin/sba").exists()
+
+for sig, expected in [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)]:
+    root = pathlib.Path(sandbox) / f"pty-package-{sig}"
+    code, out = launch(root, "install", b"PACKAGE_READY", sig, WAIT_PACKAGE="1")
+    assert code == expected, (code, out)
+    assert not (root / "mock/package").exists()
+    assert not (root / "var/lib/singbox-agent/transaction").exists()
+    assert launch(root, "install")[0] == 0
+    assert (root / "usr/local/bin/sba").exists()
+
+root = pathlib.Path(sandbox) / "pty-failed-purge"
+code, out = launch(root, "install", b"PACKAGE_READY", WAIT_PACKAGE="1", FAIL_PURGE="1")
+assert code == 130, (code, out)
+assert (root / "var/lib/singbox-agent/transaction/record.conf").exists()
+assert (root / "etc/apt/sources.list.d/sagernet.sources").exists()
+assert launch(root, "install")[0] == 0
+assert (root / "usr/local/bin/sba").exists()
+
+root = pathlib.Path(sandbox) / "pty-kill"
+code, out = launch(root, "kill-uncommitted", b"TRANSACTION_READY", signal.SIGKILL)
+assert code == -signal.SIGKILL, (code, out)
+assert launch(root, "install")[0] == 0
+
+root = pathlib.Path(sandbox) / "pty-lock"
+env = dict(os.environ, PROJECT_DIR=project, SBA_ROOT=str(root))
+holder = subprocess.Popen(["bash", harness, "lock-wait"], env=env, stdout=subprocess.PIPE, start_new_session=True)
+try:
+    assert select.select([holder.stdout], [], [], 5)[0], "lock holder did not start"
+    assert holder.stdout.readline() == b"LOCK_READY\n"
+    result = subprocess.run(["bash", harness, "lock-once"], env=env, capture_output=True, timeout=5)
+    assert result.returncode == 1, result
+    assert "已有安装或恢复正在运行" in result.stderr.decode()
+finally:
+    os.killpg(holder.pid, signal.SIGKILL)
+    holder.wait()
+PY
+else
+    printf '跳过：真实 Ctrl+C、HUP、TERM、SIGKILL 与锁竞争需要 Linux 伪终端。\n'
+fi
+printf '安装恢复：%s 项测试通过。\n' "$passed"
