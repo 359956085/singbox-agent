@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.1.2"
 readonly STATE_VERSION="1"
 readonly OFFICIAL_KEY_URL="https://sing-box.app/gpg.key"
 readonly OFFICIAL_REPO_URL="https://deb.sagernet.org/"
@@ -558,12 +558,11 @@ probe_reality_target() {
 choose_random_reality_target() {
     local candidate
     local -a candidates=(
-        "addons.mozilla.org:443"
-        "www.python.org:443"
-        "www.oracle.com:443"
-        "www.samsung.com:443"
-        "www.amd.com:443"
-        "www.swift.com:443"
+        "hungrygowhere.com:443"
+        "www.janio.asia:443"
+        "servishero.com:443"
+        "mochajs.org:443"
+        "gohugo.io:443"
     )
     while IFS= read -r candidate; do
         REALITY_HOST="${candidate%:*}"
@@ -669,7 +668,7 @@ prompt_reality_target() {
         fi
         host="${host,,}"
         if ! validate_hostname "$host" || ! validate_port "$port"; then
-            warn "请输入合法域名和端口，例如 addons.mozilla.org:443。"
+            warn "请输入合法域名和端口，例如 hungrygowhere.com:443。"
             continue
         fi
         info "验证 ${host}:${port} 的 TLS 1.3 和证书。"

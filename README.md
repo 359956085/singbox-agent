@@ -23,7 +23,21 @@ apt-get update && apt-get install -y wget ca-certificates && wget -O /tmp/singbo
 4. HTTP 订阅端口。
 5. Reality 目标域名与端口。
 
-端口留空时随机选择。Reality 目标留空时，从内置候选中选择通过 DNS、TLS 1.3 和证书校验的站点。
+端口留空时随机选择。Reality 目标留空时，随机探测内置 AWS 新加坡候选，选择通过 DNS、TLS 1.3 和证书校验的站点；也可手工输入目标。已有节点的目标不会自动迁移。
+
+内置候选端口均为 `443`：
+
+| 域名 | 网站用途 |
+| --- | --- |
+| `hungrygowhere.com` | 新加坡美食资讯与餐厅推荐 |
+| `www.janio.asia` | 跨境物流与供应链服务 |
+| `servishero.com` | 家政与维修服务 |
+| `mochajs.org` | Mocha JavaScript 测试框架 |
+| `gohugo.io` | Hugo 静态网站生成器 |
+
+2026-11-17 从 Ubuntu4 复核：上述域名当时解析出的 IPv4、IPv6 地址均匹配 [AWS 官方地址段](https://docs.aws.amazon.com/vpc/latest/userguide/aws-ip-ranges.html)的 `ap-southeast-1` 区域及同名网络边界组；所有 IPv4 地址通过 TLS 1.3、HTTP/2 和证书校验，各域名首页 HEAD 请求返回 `200`。IPv6 仅核对地址归属，未做连接验收。后四个域名共享区域前端，故障独立性有限。
+
+这是实测后的静态名单，不保留原全球站点兜底。DNS 和部署区域可能变化；安装时仅沿用 DNS、TLS 和证书检测，不下载 AWS 地址段或保证接入区域仍为新加坡。候选均不可用时会提示手工输入目标。
 
 节点参数在安装依赖和 sing-box 软件包之前询问。按 Ctrl+C 取消后，可再次执行同一条一键安装命令。脚本会先恢复未完成安装，再开始新的安装；SSH 断开或进程强制终止后也会在下次安装时检查恢复记录。
 
