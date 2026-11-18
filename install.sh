@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.1.2"
+readonly SCRIPT_VERSION="1.1.3"
 readonly STATE_VERSION="1"
 readonly OFFICIAL_KEY_URL="https://sing-box.app/gpg.key"
 readonly OFFICIAL_REPO_URL="https://deb.sagernet.org/"
@@ -17,11 +17,15 @@ APP_DIR="${ROOT_PREFIX}/etc/singbox-agent"
 STATE_FILE="${APP_DIR}/state.conf"
 URI_FILE="${APP_DIR}/vless-uri.txt"
 QR_FILE="${APP_DIR}/vless.png"
+IPV6_URI_FILE="${APP_DIR}/vless-ipv6-uri.txt"
+IPV6_QR_FILE="${APP_DIR}/vless-ipv6.png"
 SINGBOX_DIR="${ROOT_PREFIX}/etc/sing-box"
 SINGBOX_CONFIG="${SINGBOX_DIR}/config.json"
 WEB_DIR="${ROOT_PREFIX}/var/lib/singbox-agent/www"
 WEB_CLASH_SUBSCRIPTION="${WEB_DIR}/clash.yaml"
 WEB_VLESS_SUBSCRIPTION="${WEB_DIR}/vless.txt"
+WEB_IPV6_CLASH_SUBSCRIPTION="${WEB_DIR}/clash-ipv6.yaml"
+WEB_IPV6_VLESS_SUBSCRIPTION="${WEB_DIR}/vless-ipv6.txt"
 LEGACY_WEB_SUBSCRIPTION="${WEB_DIR}/subscription.txt"
 NGINX_SITE_AVAILABLE="${ROOT_PREFIX}/etc/nginx/sites-available/singbox-agent-subscription"
 NGINX_SITE_ENABLED="${ROOT_PREFIX}/etc/nginx/sites-enabled/singbox-agent-subscription"
@@ -47,6 +51,8 @@ TX_NGINX_WAS_ACTIVE=0
 TX_SINGBOX_WAS_ENABLED=0
 TX_NGINX_WAS_ENABLED=0
 TX_PHASE="pending"
+TX_VERSION=2
+PUBLIC_IPV6=""
 INSTALL_LOCK_FD=""
 TRAP_OWNER_PID="$BASHPID"
 
@@ -59,12 +65,20 @@ transaction_paths() {
         "${APP_DIR}/.singbox-agent-uri.tmp" "${APP_DIR}/.singbox-agent-qr.tmp" \
         "${WEB_DIR}/.singbox-agent-clash.tmp" "${WEB_DIR}/.singbox-agent-vless.tmp" \
         "$(dirname "$NGINX_SITE_AVAILABLE")/.singbox-agent-nginx.tmp"
+    if [[ "$TX_VERSION" == 2 ]]; then
+        printf '%s\n' "$IPV6_URI_FILE" "$IPV6_QR_FILE" "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION" \
+            "${APP_DIR}/.singbox-agent-uri-ipv6.tmp" "${APP_DIR}/.singbox-agent-qr-ipv6.tmp" \
+            "${WEB_DIR}/.singbox-agent-clash-ipv6.tmp" "${WEB_DIR}/.singbox-agent-vless-ipv6.tmp"
+    fi
 }
 
 transaction_names() {
     printf '%s\n' singbox-config nginx-site nginx-link clash-subscription vless-subscription \
         legacy-subscription uri qr state manager command-link \
         temp-config temp-state temp-uri temp-qr temp-clash temp-vless temp-nginx
+    if [[ "$TX_VERSION" == 2 ]]; then
+        printf '%s\n' uri-ipv6 qr-ipv6 clash-ipv6 vless-ipv6 temp-uri-ipv6 temp-qr-ipv6 temp-clash-ipv6 temp-vless-ipv6
+    fi
 }
 
 artifact_temp() {
@@ -98,7 +112,7 @@ write_transaction() {
     local temp
     temp="$(mktemp "${TX_DIR}/.record.XXXXXX")" || return 1
     {
-        printf 'VERSION=1\nPHASE=%s\n' "$TX_PHASE"
+        printf 'VERSION=%s\nPHASE=%s\n' "$TX_VERSION" "$TX_PHASE"
         printf 'TX_SINGBOX_INSTALLED=%s\n' "$TX_SINGBOX_INSTALLED"
         printf 'TX_APT_KEY_CREATED=%s\n' "$TX_APT_KEY_CREATED"
         printf 'TX_APT_SOURCE_CREATED=%s\n' "$TX_APT_SOURCE_CREATED"
@@ -123,7 +137,9 @@ load_transaction() {
         [[ -z "${seen[$key]:-}" ]] || return 1
         seen[$key]=1
         case "$key" in
-            VERSION) [[ "$value" == 1 ]] || return 1 ;;
+            VERSION)
+                [[ "$value" == 1 || "$value" == 2 ]] || return 1
+                TX_VERSION="$value" ;;
             PHASE)
                 [[ "$value" == pending || "$value" == committed ]] || return 1
                 TX_PHASE="$value" ;;
@@ -507,18 +523,39 @@ url_encode() {
 
 build_vless_uri() {
     local address node_encoded
-    address="$(format_url_host "$PUBLIC_IP")"
-    node_encoded="$(url_encode "$NODE_NAME")"
+    address="$(format_url_host "${1:-$PUBLIC_IP}")"
+    node_encoded="$(url_encode "${2:-$NODE_NAME}")"
     printf 'vless://%s@%s:%s?encryption=none&security=reality&type=tcp&sni=%s&fp=chrome&pbk=%s&sid=%s&flow=xtls-rprx-vision#%s' \
         "$UUID" "$address" "$REALITY_PORT" "$REALITY_HOST" "$PUBLIC_KEY" "$SHORT_ID" "$node_encoded"
 }
 
 build_clash_subscription_url() {
-    printf 'http://%s:%s/sub/%s' "$(format_url_host "$PUBLIC_IP")" "$SUBSCRIPTION_PORT" "$SUBSCRIPTION_TOKEN"
+    printf 'http://%s:%s/sub/%s' "$(format_url_host "${1:-$PUBLIC_IP}")" "$SUBSCRIPTION_PORT" "$SUBSCRIPTION_TOKEN"
 }
 
 build_vless_subscription_url() {
-    printf 'http://%s:%s/sub/%s/vless' "$(format_url_host "$PUBLIC_IP")" "$SUBSCRIPTION_PORT" "$SUBSCRIPTION_TOKEN"
+    printf 'http://%s:%s/sub/%s/vless' "$(format_url_host "${1:-$PUBLIC_IP}")" "$SUBSCRIPTION_PORT" "$SUBSCRIPTION_TOKEN"
+}
+
+has_additional_ipv6() {
+    [[ -n "$PUBLIC_IPV6" ]] && validate_ipv4 "$PUBLIC_IP"
+}
+
+validate_public_ipv6() {
+    # 当前公网全局单播地址为 2000::/3；不接受链路本地、回环或 ULA。
+    [[ "$1" == [23]* ]] && validate_ipv6 "$1"
+}
+
+detect_public_ipv6() {
+    local ip
+    if command_exists curl; then
+        ip="$(curl -6fsS --connect-timeout 5 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
+    else
+        ip="$(wget -6 -qO- -T 8 -t 1 https://api6.ipify.org 2>/dev/null || true)"
+    fi
+    ip="$(trim "$ip")"
+    validate_public_ipv6 "$ip" || return 1
+    printf '%s' "$ip"
 }
 
 detect_public_ip() {
@@ -533,17 +570,7 @@ detect_public_ip() {
         printf '%s' "$ip"
         return 0
     fi
-    if command_exists curl; then
-        ip="$(curl -6fsS --connect-timeout 5 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
-    else
-        ip="$(wget -6 -qO- -T 8 -t 1 https://api6.ipify.org 2>/dev/null || true)"
-    fi
-    ip="$(trim "$ip")"
-    if validate_ipv6 "$ip"; then
-        printf '%s' "$ip"
-        return 0
-    fi
-    return 1
+    detect_public_ipv6
 }
 
 probe_reality_target() {
@@ -612,6 +639,35 @@ prompt_public_ip() {
             return
         fi
         warn "请输入合法 IPv4 或 IPv6 地址。"
+    done
+}
+
+prompt_additional_ipv6() {
+    local default_value="${1:-}" input
+    if ! validate_ipv4 "$PUBLIC_IP"; then
+        PUBLIC_IPV6=""
+        return 0
+    fi
+    if [[ -z "$default_value" ]]; then
+        default_value="$(detect_public_ipv6 || true)"
+    fi
+    while true; do
+        read -r -p "附加公网 IPv6${default_value:+ [$default_value]}（输入 - 跳过或移除）：" input
+        input="$(trim "$input")"
+        input="${input:-$default_value}"
+        input="${input#[}"
+        input="${input%]}"
+        if [[ -z "$input" || "$input" == - ]]; then
+            PUBLIC_IPV6=""
+            LISTEN_ADDRESS="0.0.0.0"
+            return 0
+        fi
+        if validate_public_ipv6 "$input"; then
+            PUBLIC_IPV6="$input"
+            LISTEN_ADDRESS="::"
+            return 0
+        fi
+        warn "请输入公网 IPv6 地址，或输入 - 跳过。"
     done
 }
 
@@ -691,6 +747,12 @@ load_state() {
     [[ "$(state_get STATE_VERSION)" == "$STATE_VERSION" ]] || fatal "状态文件版本不受支持。"
     NODE_NAME="$(printf '%s' "$(state_get NODE_NAME_B64)" | base64 -d)"
     PUBLIC_IP="$(state_get PUBLIC_IP)"
+    PUBLIC_IPV6="$(state_get PUBLIC_IPV6)"
+    if [[ -n "$PUBLIC_IPV6" ]]; then
+        if ! validate_ipv4 "$PUBLIC_IP" || ! validate_public_ipv6 "$PUBLIC_IPV6"; then
+            fatal "状态中的附加 IPv6 地址无效。"
+        fi
+    fi
     LISTEN_ADDRESS="$(state_get LISTEN_ADDRESS)"
     REALITY_PORT="$(state_get REALITY_PORT)"
     SUBSCRIPTION_PORT="$(state_get SUBSCRIPTION_PORT)"
@@ -721,6 +783,7 @@ write_state() {
         printf 'SCRIPT_VERSION=%s\n' "$SCRIPT_VERSION"
         printf 'NODE_NAME_B64=%s\n' "$node_b64"
         printf 'PUBLIC_IP=%s\n' "$PUBLIC_IP"
+        printf 'PUBLIC_IPV6=%s\n' "$PUBLIC_IPV6"
         printf 'LISTEN_ADDRESS=%s\n' "$LISTEN_ADDRESS"
         printf 'REALITY_PORT=%s\n' "$REALITY_PORT"
         printf 'SUBSCRIPTION_PORT=%s\n' "$SUBSCRIPTION_PORT"
@@ -919,14 +982,24 @@ install_singbox_config() {
 }
 
 render_nginx_config() {
-    local output="$1"
-    local listen_directive
+    local output="$1" listen_directive
     if validate_ipv6 "$PUBLIC_IP"; then
         listen_directive="listen [::]:${SUBSCRIPTION_PORT} ipv6only=on default_server;"
     else
-        listen_directive="listen ${SUBSCRIPTION_PORT} default_server;"
+        listen_directive="listen 0.0.0.0:${SUBSCRIPTION_PORT} default_server;"
     fi
-    cat >"$output" <<EOF
+    {
+        render_nginx_server "$listen_directive" "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION"
+        if has_additional_ipv6; then
+            render_nginx_server "listen [::]:${SUBSCRIPTION_PORT} ipv6only=on default_server;" \
+                "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION"
+        fi
+    } >"$output"
+}
+
+render_nginx_server() {
+    local listen_directive="$1" clash_file="$2" vless_file="$3"
+    cat <<EOF
 # 此文件由 singbox-agent 管理，请勿手工修改。
 server {
     ${listen_directive}
@@ -936,14 +1009,14 @@ server {
 
     location = /sub/${SUBSCRIPTION_TOKEN} {
         limit_except GET { deny all; }
-        alias ${WEB_CLASH_SUBSCRIPTION};
+        alias ${clash_file};
         default_type application/yaml;
         add_header Cache-Control "no-store" always;
     }
 
     location = /sub/${SUBSCRIPTION_TOKEN}/vless {
         limit_except GET { deny all; }
-        alias ${WEB_VLESS_SUBSCRIPTION};
+        alias ${vless_file};
         default_type text/plain;
         add_header Cache-Control "no-store" always;
     }
@@ -962,9 +1035,9 @@ yaml_quote() {
 render_mihomo_subscription() {
     local output="$1"
     local clash_node_name node_quoted server_quoted uuid_quoted sni_quoted public_key_quoted short_id_quoted
-    clash_node_name="${NODE_NAME}-Reality"
+    clash_node_name="${3:-$NODE_NAME}-Reality"
     node_quoted="$(yaml_quote "$clash_node_name")"
-    server_quoted="$(yaml_quote "$PUBLIC_IP")"
+    server_quoted="$(yaml_quote "${2:-$PUBLIC_IP}")"
     uuid_quoted="$(yaml_quote "$UUID")"
     sni_quoted="$(yaml_quote "$REALITY_HOST")"
     public_key_quoted="$(yaml_quote "$PUBLIC_KEY")"
@@ -1001,28 +1074,39 @@ EOF
 }
 
 write_client_artifacts() {
-    local uri clash_temp vless_temp uri_temp qr_temp
-    uri="$(build_vless_uri)"
     mkdir -p -- "$APP_DIR" "$WEB_DIR"
     chmod 700 "$APP_DIR"
     chmod 711 "$(dirname "$WEB_DIR")" "$WEB_DIR"
-    uri_temp="$(artifact_temp "$APP_DIR" uri)"
+    write_address_artifacts "$PUBLIC_IP" "$NODE_NAME" "$URI_FILE" "$QR_FILE" "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION"
+    if has_additional_ipv6; then
+        write_address_artifacts "$PUBLIC_IPV6" "${NODE_NAME}-IPv6" "$IPV6_URI_FILE" "$IPV6_QR_FILE" \
+            "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION" -ipv6
+    else
+        rm -f -- "$IPV6_URI_FILE" "$IPV6_QR_FILE" "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION"
+    fi
+}
+
+write_address_artifacts() {
+    local address="$1" name="$2" uri_file="$3" qr_file="$4" clash_file="$5" vless_file="$6" suffix="${7:-}"
+    local uri clash_temp vless_temp uri_temp qr_temp
+    uri="$(build_vless_uri "$address" "$name")"
+    uri_temp="$(artifact_temp "$APP_DIR" "uri${suffix}")"
     printf '%s\n' "$uri" >"$uri_temp"
     chmod 600 "$uri_temp"
-    mv -f -- "$uri_temp" "$URI_FILE"
-    qr_temp="$(artifact_temp "$APP_DIR" qr)"
+    mv -f -- "$uri_temp" "$uri_file"
+    qr_temp="$(artifact_temp "$APP_DIR" "qr${suffix}")"
     qrencode -o "$qr_temp" -s 4 -m 1 "$uri"
     chmod 600 "$qr_temp"
-    mv -f -- "$qr_temp" "$QR_FILE"
-    clash_temp="$(artifact_temp "$WEB_DIR" clash)"
-    render_mihomo_subscription "$clash_temp"
+    mv -f -- "$qr_temp" "$qr_file"
+    clash_temp="$(artifact_temp "$WEB_DIR" "clash${suffix}")"
+    render_mihomo_subscription "$clash_temp" "$address" "$name"
     chmod 644 "$clash_temp"
-    mv -f -- "$clash_temp" "$WEB_CLASH_SUBSCRIPTION"
-    vless_temp="$(artifact_temp "$WEB_DIR" vless)"
+    mv -f -- "$clash_temp" "$clash_file"
+    vless_temp="$(artifact_temp "$WEB_DIR" "vless${suffix}")"
     printf '%s\n' "$uri" | base64 -w 0 >"$vless_temp"
     printf '\n' >>"$vless_temp"
     chmod 644 "$vless_temp"
-    mv -f -- "$vless_temp" "$WEB_VLESS_SUBSCRIPTION"
+    mv -f -- "$vless_temp" "$vless_file"
 }
 
 install_nginx_config() {
@@ -1105,6 +1189,65 @@ start_services() {
         systemctl enable --now nginx.service
     fi
     systemctl is-active --quiet nginx.service || fatal "nginx 启动失败。"
+    verify_ipv6_listeners
+}
+
+check_ipv6_prerequisites() {
+    local address route
+    if has_additional_ipv6; then
+        address="$PUBLIC_IPV6"
+    elif validate_ipv6 "$PUBLIC_IP"; then
+        address="$PUBLIC_IP"
+    else
+        return 0
+    fi
+    [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] || fatal "系统未提供 IPv6 支持。"
+    [[ "$(</proc/sys/net/ipv6/conf/all/disable_ipv6)" == 0 ]] || fatal "系统 IPv6 已禁用，请先配置后重试。"
+    route="$(ip -6 route get "$address" 2>/dev/null || true)"
+    [[ "$route" == local\ * ]] || fatal "IPv6 地址 ${address} 未配置在本机，请先配置网卡地址。"
+    [[ -n "$(ip -6 route show default)" ]] || fatal "未找到 IPv6 默认路由，请先配置 IPv6 联网。"
+}
+
+verify_ipv6_listeners() {
+    local host attempt ready
+    if ! has_additional_ipv6 && ! validate_ipv6 "$PUBLIC_IP"; then
+        return 0
+    fi
+    local -a hosts=(::1)
+    if has_additional_ipv6; then
+        hosts+=(127.0.0.1)
+    fi
+    for host in "${hosts[@]}"; do
+        ready=0
+        # nginx reload 返回时新 worker 可能尚未准备好，允许短暂重试。
+        for attempt in {1..10}; do
+            # bash -c 的位置参数由子 Bash 展开，不将地址拼接成命令。
+            # shellcheck disable=SC2016
+            if timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$REALITY_PORT" 2>/dev/null && \
+                curl --noproxy '*' -fsS --connect-timeout 3 --max-time 5 \
+                    "http://$(format_url_host "$host"):${SUBSCRIPTION_PORT}/sub/${SUBSCRIPTION_TOKEN}/vless" >/dev/null 2>&1; then
+                ready=1
+                break
+            fi
+            sleep 0.2
+        done
+        [[ "$ready" == 1 ]] || fatal "${host} 的节点 TCP ${REALITY_PORT} 或订阅 HTTP ${SUBSCRIPTION_PORT} 检查失败，已停止提交配置。"
+    done
+}
+
+diagnose_ipv6_firewall() {
+    local port
+    if ! has_additional_ipv6 && ! validate_ipv6 "$PUBLIC_IP"; then
+        return 0
+    fi
+    if ufw_is_active; then
+        for port in "$REALITY_PORT" "$SUBSCRIPTION_PORT"; do
+            if ! ufw status | grep -E "(^|[[:space:]])${port}/tcp[[:space:]]+\\(v6\\).*ALLOW" >/dev/null; then
+                warn "未检测到 UFW 的 IPv6 TCP ${port} 放行规则；请检查 UFW IPv6 设置和规则。"
+            fi
+        done
+    fi
+    warn "请确认云防火墙已允许 IPv6 TCP ${REALITY_PORT}（节点）和 ${SUBSCRIPTION_PORT}（订阅）。本地检查不代表公网入站可达。"
 }
 
 begin_transaction() {
@@ -1118,6 +1261,7 @@ begin_transaction() {
     mkdir -- "$staging"
     chmod 700 "$staging"
     TX_DIR="$staging"
+    TX_VERSION=2
     TX_PHASE=pending
     TX_SINGBOX_INSTALLED=0
     TX_APT_KEY_CREATED=0
@@ -1181,6 +1325,7 @@ configure_installation() {
 
     prompt_node_name "$default_node"
     prompt_public_ip "$default_ip"
+    prompt_additional_ipv6 "$PUBLIC_IPV6"
     prompt_port REALITY_PORT "Reality 端口" 20000 39999 "$default_reality_port" "$old_reality_port"
     while true; do
         prompt_port SUBSCRIPTION_PORT "订阅 HTTP 端口" 40000 59999 "$default_subscription_port" "$old_subscription_port"
@@ -1199,6 +1344,7 @@ configure_installation() {
         install_singbox_package
         generate_credentials
     fi
+    check_ipv6_prerequisites
     install_singbox_config
     write_client_artifacts
     install_nginx_config
@@ -1209,6 +1355,7 @@ configure_installation() {
     UFW_SUBSCRIPTION_RULE_CREATED=0
     add_ufw_rule "$REALITY_PORT" UFW_REALITY_RULE_CREATED
     add_ufw_rule "$SUBSCRIPTION_PORT" UFW_SUBSCRIPTION_RULE_CREATED
+    diagnose_ipv6_firewall
     TX_UFW_REALITY_ADDED="$UFW_REALITY_RULE_CREATED"
     TX_UFW_SUBSCRIPTION_ADDED="$UFW_SUBSCRIPTION_RULE_CREATED"
     write_transaction
@@ -1256,11 +1403,8 @@ install_command() {
 }
 
 show_configuration() {
-    local uri clash_subscription_url vless_subscription_url singbox_status nginx_status version
+    local singbox_status nginx_status version
     load_state
-    uri="$(build_vless_uri)"
-    clash_subscription_url="$(build_clash_subscription_url)"
-    vless_subscription_url="$(build_vless_subscription_url)"
     singbox_status="$(systemctl is-active sing-box.service 2>/dev/null || true)"
     nginx_status="$(systemctl is-active nginx.service 2>/dev/null || true)"
     version="$(sing-box version 2>/dev/null | awk '/sing-box version/ {print $3; exit}')"
@@ -1268,14 +1412,36 @@ show_configuration() {
     printf 'sing-box：%s（%s）\n' "${singbox_status:-未知}" "${version:-未知版本}"
     printf 'nginx：%s\n' "${nginx_status:-未知}"
     printf '节点：%s\n' "$NODE_NAME"
-    printf '地址：%s:%s\n' "$PUBLIC_IP" "$REALITY_PORT"
+    printf '地址：%s:%s\n' "$(format_url_host "$PUBLIC_IP")" "$REALITY_PORT"
+    if has_additional_ipv6; then
+        printf 'IPv6 地址：[%s]:%s\n' "$PUBLIC_IPV6" "$REALITY_PORT"
+    fi
     printf 'Reality 目标：%s:%s\n' "$REALITY_HOST" "$REALITY_DEST_PORT"
     printf '公钥：%s\n' "$PUBLIC_KEY"
     printf 'short ID：%s\n' "$SHORT_ID"
+    if validate_ipv6 "$PUBLIC_IP"; then
+        show_address_configuration IPv6 "$PUBLIC_IP" "$NODE_NAME" "$QR_FILE"
+    else
+        show_address_configuration IPv4 "$PUBLIC_IP" "$NODE_NAME" "$QR_FILE"
+    fi
+    if has_additional_ipv6; then
+        show_address_configuration IPv6 "$PUBLIC_IPV6" "${NODE_NAME}-IPv6" "$IPV6_QR_FILE"
+    fi
+    warn "在线订阅使用 HTTP。请把随机 URL 当作敏感凭据保存。"
+}
+
+show_address_configuration() {
+    local family="$1" address="$2" name="$3" qr_file="$4"
+    local uri clash_subscription_url vless_subscription_url
+    uri="$(build_vless_uri "$address" "$name")"
+    clash_subscription_url="$(build_clash_subscription_url "$address")"
+    vless_subscription_url="$(build_vless_subscription_url "$address")"
+    printf '\n%b===== %s =====%b\n' "$color_blue" "$family" "$color_reset"
+    printf '节点：%s\n地址：%s:%s\n' "$name" "$(format_url_host "$address")" "$REALITY_PORT"
     printf '\n%b===== VLESS / Shadowrocket =====%b\n' "$color_blue" "$color_reset"
     printf '原始 VLESS 单节点 URI：\n%s\n' "$uri"
     printf '\nBase64 VLESS 订阅 URL：\n%s\n' "$vless_subscription_url"
-    printf '\n原始 VLESS 单节点二维码 PNG：%s\n' "$QR_FILE"
+    printf '\n原始 VLESS 单节点二维码 PNG：%s\n' "$qr_file"
     printf '\nShadowrocket 订阅二维码：\n\n'
     if command_exists qrencode; then
         qrencode -t ANSIUTF8 -m 1 "$vless_subscription_url" || warn "终端二维码生成失败。"
@@ -1283,7 +1449,6 @@ show_configuration() {
 
     printf '\n%b===== Clash / Mihomo =====%b\n' "$color_blue" "$color_reset"
     printf 'YAML 订阅 URL：\n%s\n' "$clash_subscription_url"
-    warn "在线订阅使用 HTTP。请把随机 URL 当作敏感凭据保存。"
 }
 
 show_command() {
@@ -1389,7 +1554,8 @@ uninstall_command() {
     [[ "$APT_SOURCE_CREATED" == "1" ]] && rm -f -- "$APT_SOURCE_FILE"
     [[ "$APT_KEY_CREATED" == "1" ]] && rm -f -- "$APT_KEY_FILE"
     rm -f -- "$SINGBOX_CONFIG" "$URI_FILE" "$QR_FILE" "$STATE_FILE" "$COMMAND_LINK" "$MANAGER_FILE" \
-        "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION" "$LEGACY_WEB_SUBSCRIPTION"
+        "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION" "$LEGACY_WEB_SUBSCRIPTION" \
+        "$IPV6_URI_FILE" "$IPV6_QR_FILE" "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION"
     rmdir "$WEB_DIR" "$(dirname "$WEB_DIR")" "$APP_DIR" "$MANAGER_DIR" 2>/dev/null || true
     rm -rf -- "$CACHE_DIR"
     success "singbox-agent 已卸载。"

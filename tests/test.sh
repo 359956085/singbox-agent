@@ -323,4 +323,5 @@ assert_false "卸载删除状态目录" test -e "$APP_DIR"
 assert_true "卸载保留用户 nginx 配置" test -e "$user_nginx_file"
 
 bash "${TEST_DIR}/recovery.sh"
+bash "${TEST_DIR}/ipv6.sh"
 printf '完成：%s 项基础测试通过。\n' "$passed"

@@ -140,6 +140,9 @@ if [[ "$action" != prompt ]]; then
     prompt_node_name() { NODE_NAME="${1:-original-node}"; }
 fi
 prompt_public_ip() { :; }
+prompt_additional_ipv6() { :; }
+check_ipv6_prerequisites() { :; }
+diagnose_ipv6_firewall() { :; }
 prompt_port() {
     if [[ "$1" == REALITY_PORT ]]; then REALITY_PORT=23456; else SUBSCRIPTION_PORT=45678; fi
 }
@@ -152,11 +155,19 @@ else
         printf '%s\n' "$UUID" >"$SINGBOX_CONFIG"
     }
 fi
-write_client_artifacts() {
-    mkdir -p "$APP_DIR" "$WEB_DIR"
-    printf '%s\n' "$UUID" >"$URI_FILE"
-    touch "$QR_FILE" "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION"
-}
+if [[ "$action" != ipv6-artifact-fail ]]; then
+    write_client_artifacts() {
+        mkdir -p "$APP_DIR" "$WEB_DIR"
+        printf '%s\n' "$UUID" >"$URI_FILE"
+        touch "$QR_FILE" "$WEB_CLASH_SUBSCRIPTION" "$WEB_VLESS_SUBSCRIPTION"
+        if has_additional_ipv6; then
+            printf 'new-uri\n' >"$IPV6_URI_FILE"
+            touch "$IPV6_QR_FILE" "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION"
+        else
+            rm -f -- "$IPV6_URI_FILE" "$IPV6_QR_FILE" "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION"
+        fi
+    }
+fi
 install_nginx_config() {
     mkdir -p "$(dirname "$NGINX_SITE_AVAILABLE")" "$(dirname "$NGINX_SITE_ENABLED")"
     touch "$NGINX_SITE_AVAILABLE"
@@ -172,6 +183,77 @@ start_services() {
 show_configuration() { :; }
 
 case "$action" in
+    ipv6-add|ipv6-remove|ipv6-reconfigure-fail|ipv6-artifact-fail|ipv6-listener-fail)
+        touch "$SBA_ROOT/mock/package"
+        mkdir -p "$APP_DIR" "$WEB_DIR" "$SINGBOX_DIR"
+        printf 'old-config\n' >"$SINGBOX_CONFIG"
+        if [[ "$action" != ipv6-add ]]; then
+            PUBLIC_IPV6=2001:db8::10
+            LISTEN_ADDRESS=::
+            for file in "$IPV6_URI_FILE" "$IPV6_QR_FILE" "$WEB_IPV6_CLASH_SUBSCRIPTION" "$WEB_IPV6_VLESS_SUBSCRIPTION"; do
+                printf 'old-ipv6\n' >"$file"
+            done
+        fi
+        write_state
+        cp "$STATE_FILE" "$SBA_ROOT/mock/original-state"
+        prompt_additional_ipv6() { PUBLIC_IPV6=2001:db8::20; LISTEN_ADDRESS=::; }
+        if [[ "$action" == ipv6-remove ]]; then
+            prompt_additional_ipv6() { PUBLIC_IPV6=""; LISTEN_ADDRESS=0.0.0.0; }
+        elif [[ "$action" == ipv6-reconfigure-fail ]]; then
+            touch "$SBA_ROOT/mock/fail-start"
+        elif [[ "$action" == ipv6-artifact-fail ]]; then
+            qrencode() {
+                [[ "$2" != *qr-ipv6.tmp ]] || return 64
+                printf 'PNG\n' >"$2"
+            }
+        elif [[ "$action" == ipv6-listener-fail ]]; then
+            start_services() { verify_ipv6_listeners; }
+            timeout() { return 1; }
+            sleep() { :; }
+        fi
+        configure_installation 1
+        [[ "$(state_get UUID)" == "$UUID" && "$(state_get PRIVATE_KEY)" == "$PRIVATE_KEY" && "$(state_get SUBSCRIPTION_TOKEN)" == "$SUBSCRIPTION_TOKEN" ]]
+        if [[ "$action" == ipv6-remove ]]; then
+            [[ -z "$(state_get PUBLIC_IPV6)" && ! -e "$IPV6_URI_FILE" && ! -e "$WEB_IPV6_VLESS_SUBSCRIPTION" ]]
+        else
+            [[ "$(state_get PUBLIC_IPV6)" == 2001:db8::20 ]]
+            uninstall_command <<<'y'
+            [[ ! -e "$IPV6_URI_FILE" && ! -e "$IPV6_QR_FILE" && ! -e "$WEB_IPV6_CLASH_SUBSCRIPTION" && ! -e "$WEB_IPV6_VLESS_SUBSCRIPTION" ]]
+        fi ;;
+    legacy-transaction|legacy-committed)
+        mkdir -p "$SINGBOX_DIR" "$APP_DIR"
+        printf 'old-config\n' >"$SINGBOX_CONFIG"
+        # 新版额外资源不属于旧事务，恢复旧事务时不得擅自删除。
+        printf 'unrelated\n' >"$IPV6_URI_FILE"
+        begin_transaction
+        sed 's/^VERSION=2$/VERSION=1/' "$TX_DIR/record.conf" >"$TX_DIR/old-record"
+        mv "$TX_DIR/old-record" "$TX_DIR/record.conf"
+        for name in uri-ipv6 qr-ipv6 clash-ipv6 vless-ipv6 temp-uri-ipv6 temp-qr-ipv6 temp-clash-ipv6 temp-vless-ipv6; do
+            rm -f -- "$TX_DIR/$name" "$TX_DIR/$name.exists" "$TX_DIR/$name.absent"
+        done
+        printf 'changed-config\n' >"$SINGBOX_CONFIG"
+        if [[ "$action" == legacy-committed ]]; then
+            sed 's/^PHASE=pending$/PHASE=committed/' "$TX_DIR/record.conf" >"$TX_DIR/committed-record"
+            mv "$TX_DIR/committed-record" "$TX_DIR/record.conf"
+        fi
+        ROLLBACK_ACTIVE=0
+        recover_transaction
+        [[ ! -e "$TRANSACTION_DIR" ]]
+        grep -Fxq unrelated "$IPV6_URI_FILE"
+        if [[ "$action" == legacy-committed ]]; then
+            grep -Fxq changed-config "$SINGBOX_CONFIG"
+        else
+            grep -Fxq old-config "$SINGBOX_CONFIG"
+        fi
+        begin_transaction
+        grep -Fxq VERSION=2 "$TX_DIR/record.conf"
+        [[ -e "$TX_DIR/uri-ipv6.exists" ]]
+        rollback_transaction ;;
+    invalid-v2-record)
+        begin_transaction
+        rm "$TX_DIR/temp-qr-ipv6.absent"
+        ROLLBACK_ACTIVE=0
+        recover_transaction ;;
     legacy|legacy-rollback)
         touch "$SBA_ROOT/mock/package"
         check_unmanaged_conflicts
@@ -319,6 +401,25 @@ fi
 run_case "$failure_root" recover 0
 check '恢复再安装后清理事务' test ! -e "$failure_root/var/lib/singbox-agent/transaction"
 run_case "$TEST_SANDBOX/reconfigure" reconfigure 0
+run_case "$TEST_SANDBOX/ipv6-add" ipv6-add 0
+check '添加 IPv6 后卸载清理全部产物' test ! -d "$TEST_SANDBOX/ipv6-add/etc/singbox-agent"
+run_case "$TEST_SANDBOX/ipv6-remove" ipv6-remove 0
+run_case "$TEST_SANDBOX/ipv6-reconfigure-fail" ipv6-reconfigure-fail 51
+check '双栈配置失败恢复旧状态' cmp "$TEST_SANDBOX/ipv6-reconfigure-fail/etc/singbox-agent/state.conf" "$TEST_SANDBOX/ipv6-reconfigure-fail/mock/original-state"
+run_case "$TEST_SANDBOX/ipv6-listener-fail" ipv6-listener-fail 1
+check 'IPv6 监听失败恢复旧状态' cmp "$TEST_SANDBOX/ipv6-listener-fail/etc/singbox-agent/state.conf" "$TEST_SANDBOX/ipv6-listener-fail/mock/original-state"
+for file in etc/singbox-agent/vless-ipv6-uri.txt etc/singbox-agent/vless-ipv6.png var/lib/singbox-agent/www/clash-ipv6.yaml var/lib/singbox-agent/www/vless-ipv6.txt; do
+    check "双栈回滚恢复 $file" grep -Fxq old-ipv6 "$TEST_SANDBOX/ipv6-reconfigure-fail/$file"
+done
+if command -v jq >/dev/null 2>&1; then
+    run_case "$TEST_SANDBOX/ipv6-artifact-fail" ipv6-artifact-fail 64
+    check 'IPv6 PNG 生成失败恢复旧 URI' grep -Fxq old-ipv6 "$TEST_SANDBOX/ipv6-artifact-fail/etc/singbox-agent/vless-ipv6-uri.txt"
+    check 'IPv6 PNG 生成失败清理暂存文件' test ! -e "$TEST_SANDBOX/ipv6-artifact-fail/etc/singbox-agent/.singbox-agent-qr-ipv6.tmp"
+fi
+run_case "$TEST_SANDBOX/legacy-transaction" legacy-transaction 0
+run_case "$TEST_SANDBOX/legacy-committed" legacy-committed 0
+run_case "$TEST_SANDBOX/invalid-v2-record" invalid-v2-record 1
+check '新版事务缺少备份时保留诊断记录' test -f "$TEST_SANDBOX/invalid-v2-record/var/lib/singbox-agent/transaction/record.conf"
 run_case "$TEST_SANDBOX/reconfigure-fail" reconfigure-fail 51
 check '重新配置失败恢复旧配置' grep -Fxq original-config "$TEST_SANDBOX/reconfigure-fail/etc/sing-box/config.json"
 check '重新配置失败恢复旧状态和凭据' cmp "$TEST_SANDBOX/reconfigure-fail/etc/singbox-agent/state.conf" "$TEST_SANDBOX/reconfigure-fail/mock/original-state"
